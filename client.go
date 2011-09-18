@@ -8,9 +8,10 @@ import (
 	"big"
 	"bufio"
 	"bytes"
-	"encoding/binary"
 	"crypto"
 	"crypto/rand"
+	"encoding/binary"
+	"fmt"
 	"net"
 	"os"
 	"sync/atomic"
@@ -33,6 +34,9 @@ func Dial(addr string, config Config) (*Client, os.Error) {
 				Writer:          bufio.NewWriter(conn),
 				rand:            rand.Reader,
 				paddingMultiple: 16,
+			},
+			Close: func() os.Error {
+				return conn.Close()
 			},
 		},
 		Config:      config,
@@ -93,14 +97,14 @@ func (c *Client) mainloop() {
 				ch := c.channels[msg.PeersId]
 				ch.resp <- msg
 			case channelRequestSuccessMsg:
-				ch := c.channels[msg.PeersId]
-				ch.resp <- msg
+                                ch := c.channels[msg.PeersId]
+                                ch.resp <- msg
 			case channelRequestFailureMsg:
-				ch := c.channels[msg.PeersId]
-				ch.resp <- msg
+                                ch := c.channels[msg.PeersId]
+                                ch.resp <- msg
 			case channelCloseMsg:
-				ch := c.channels[msg.PeersId]
-				ch.resp <- msg
+                                ch := c.channels[msg.PeersId]
+                                ch.resp <- msg
 			default:
 				debug("mainloop: unhandled packet type", packet[0])
 			}
@@ -243,9 +247,9 @@ func (c *Client) sendServiceReq(name string) os.Error {
 }
 
 func (c *Client) sendUserAuthReq(method string) os.Error {
-	length := stringLength(c.Config.Password) + 1
+	length := stringLength([]byte(c.Config.Password)) + 1
 	payload := make([]byte, length)
-	marshalString(payload[1:], c.Config.Password) // payload[0] == 0 == boolean:false
+	marshalString(payload[1:], []byte(c.Config.Password)) // payload[0] == 0 == boolean:false
 
 	return c.sendMessage(msgUserAuthRequest, userAuthRequestMsg{
 		User:    c.Config.User,
@@ -352,11 +356,11 @@ func (c *ClientChan) Close() os.Error {
 // Pass an environment variable to a channel to be applied
 // to any shell/command started later
 func (c *ClientChan) Setenv(name, value string) os.Error {
-	namLen := stringLength(name)
-	valLen := stringLength(value)
+	namLen := stringLength([]byte(name))
+	valLen := stringLength([]byte(value))
 	payload := make([]byte, namLen+valLen)
-	marshalString(payload[:namLen], name)
-	marshalString(payload[namLen:], value)
+	marshalString(payload[:namLen], []byte(name))
+	marshalString(payload[namLen:], []byte(value))
 
 	if err := c.client.sendMessage(msgChannelRequest, channelRequestMsg{
 		PeersId:             c.peerId,
@@ -404,32 +408,132 @@ func (c *ClientChan) PtyReq(term string, h, w int) os.Error {
 }
 
 func (c *ClientChan) Exec(command string) os.Error {
-	cmdLen := stringLength(command)
+	cmdLen := stringLength([]byte(command))
 	payload := make([]byte, cmdLen)
-	marshalString(payload, command)
-        if err := c.client.sendMessage(msgChannelRequest, channelRequestMsg{
-                PeersId:             c.peerId,
-                Request:             "exec",
-                WantReply:           true,
-                RequestSpecificData: payload,
-        }); err != nil {
-                return err
-        }
-        switch resp := <-c.resp; resp.(type) {
-        case channelRequestSuccessMsg:
-                return nil
-        case channelRequestFailureMsg:
-                return os.NewError("unable to execure \""+command+"\"")
-        }
-        panic("unreachable")
+	marshalString(payload, []byte(command))
+	if err := c.client.sendMessage(msgChannelRequest, channelRequestMsg{
+		PeersId:             c.peerId,
+		Request:             "exec",
+		WantReply:           true,
+		RequestSpecificData: payload,
+	}); err != nil {
+		return err
+	}
+	switch resp := <-c.resp; resp.(type) {
+	case channelRequestSuccessMsg:
+		return nil
+	case channelRequestFailureMsg:
+		return os.NewError("unable to execure \"" + command + "\"")
+	}
+	panic("unreachable")
+}
+
+// Send a message to the remote peer
+func (t *transport) sendMessage(typ uint8, msg interface{}) os.Error {
+	packet := marshal(typ, msg)
+	return t.writePacket(packet)
 }
 
 func debug(args ...interface{}) {
-        fmt.Println(args...)
+	fmt.Println(args...)
 }
 
 type Config struct {
-        User     string
-        Password string // used for "password" method authentication
+	User     string
+	Password string // used for "password" method authentication
 }
 
+func decode(packet []byte) interface{} {
+	switch packet[0] {
+	case msgDisconnect:
+	case msgIgnore:
+	case msgUnimplemented:
+	case msgDebug:
+	case msgServiceRequest:
+		var msg serviceRequestMsg
+		if err := unmarshal(msg, packet, msgServiceRequest); err != nil {
+			return err
+		}
+		return msg
+	case msgServiceAccept:
+		var msg serviceAcceptMsg
+		if err := unmarshal(msg, packet, msgServiceAccept); err != nil {
+			return err
+		}
+		return msg
+	case msgKexInit:
+	case msgNewKeys:
+	case msgKexDHInit:
+	case msgKexDHReply:
+	case msgUserAuthRequest:
+	case msgUserAuthFailure:
+	case msgUserAuthSuccess:
+	case msgUserAuthBanner:
+	case msgUserAuthPubKeyOk:
+	case msgGlobalRequest:
+	case msgRequestSuccess:
+		var msg channelRequestSuccessMsg
+		if err := unmarshal(&msg, packet, msgRequestSuccess); err != nil {
+			return err
+		}
+		return msg
+	case msgRequestFailure:
+		var msg channelRequestFailureMsg
+		if err := unmarshal(&msg, packet, msgRequestFailure); err != nil {
+			return err
+		}
+		return msg
+	case msgChannelOpen:
+		var msg channelOpenMsg
+		if err := unmarshal(&msg, packet, msgChannelOpen); err != nil {
+			return err
+		}
+		return msg
+	case msgChannelOpenConfirm:
+		var msg channelOpenConfirmMsg
+		if err := unmarshal(&msg, packet, msgChannelOpenConfirm); err != nil {
+			return err
+		}
+		return msg
+	case msgChannelOpenFailure:
+		var msg channelOpenFailureMsg
+		if err := unmarshal(&msg, packet, msgChannelOpenFailure); err != nil {
+			return err
+		}
+		return msg
+	case msgChannelWindowAdjust:
+		var msg windowAdjustMsg
+		if err := unmarshal(&msg, packet, msgChannelWindowAdjust); err != nil {
+			return err
+		}
+		return msg
+	case msgChannelData:
+	case msgChannelExtendedData:
+	case msgChannelEOF:
+	case msgChannelClose:
+		var msg channelCloseMsg
+		if err := unmarshal(&msg, packet, msgChannelClose); err != nil {
+			return err
+		}
+		return msg
+	case msgChannelRequest:
+		var msg channelRequestMsg
+		if err := unmarshal(&msg, packet, msgChannelRequest); err != nil {
+			return err
+		}
+		return msg
+	case msgChannelSuccess:
+		var msg channelRequestSuccessMsg
+		if err := unmarshal(&msg, packet, msgChannelSuccess); err != nil {
+			return err
+		}
+		return msg
+	case msgChannelFailure:
+		var msg channelRequestFailureMsg
+		if err := unmarshal(&msg, packet, msgChannelFailure); err != nil {
+			return err
+		}
+		return msg
+	}
+	return UnexpectedMessageError{0, packet[0]}
+}
