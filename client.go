@@ -7,13 +7,12 @@ package ssh
 import (
 	"big"
 	"bufio"
-	"bytes"
 	"crypto"
 	"crypto/rand"
-	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 )
 
@@ -25,44 +24,44 @@ func Dial(addr string, config Config) (*Client, os.Error) {
 	if err != nil {
 		return nil, err
 	}
-	client := &Client{
-		transport: &transport{
-			reader: reader{
-				Reader: bufio.NewReader(conn),
-			},
-			writer: writer{
-				Writer:          bufio.NewWriter(conn),
-				rand:            rand.Reader,
-				paddingMultiple: 16,
-			},
-			Close: func() os.Error {
-				return conn.Close()
-			},
-		},
-		Config:      config,
-		channels:    make(map[uint32]*ClientChan),
-		stop:        make(chan bool),
-		in:          make(chan []byte, 1),
-		inErr:       make(chan os.Error),
-		openChannel: make(chan chan interface{}, 1),
-	}
+	client := newClient(conn, config)
 	if err := client.handshake(); err != nil {
+		// don't leak client if the handshake failed
+		client.Close()
 		return nil, err
 	}
 	go client.mainloop()
 	return client, nil
 }
 
+func newClient(conn net.Conn, config Config) *Client {
+	return &Client{
+                transport: &transport{
+                        reader: reader{
+                                Reader: bufio.NewReader(conn),
+                        },
+                        writer: writer{
+                                Writer: bufio.NewWriter(conn),
+                                rand:   rand.Reader,
+				Mutex: new(sync.Mutex),
+                        },
+                        Close: func() os.Error {
+                                return conn.Close()
+                        },
+                },
+                Config:      config,
+                channels:    make(map[uint32]chan interface{}),
+		op:	make(chan interface{}, 4),
+        }
+}
+
 type Client struct {
 	*transport
-	in          chan []byte // decrpted packets
-	inErr       chan os.Error
 	Config      Config
 	magics      handshakeMagics
-	channels    map[uint32]*ClientChan
+	channels    map[uint32]chan interface{}
+	op    chan interface{}
 	nextId      uint32                // net channel id
-	stop        chan bool             // callled on Client.Close()
-	openChannel chan chan interface{} // request new channels
 }
 
 func (c *Client) nextChanId() uint32 {
@@ -70,66 +69,37 @@ func (c *Client) nextChanId() uint32 {
 }
 
 func (c *Client) mainloop() {
-	// read incoming packets in a goroutine 
+	// make readPacket() non blocking
 	go func() {
 		for {
 			packet, err := c.readPacket()
 			if err != nil {
 				// we can't recover from an error in readPacket
-				c.inErr <- err // blocks until err is received
+				c.op <- err // blocks until err is received
 				return
 			}
-			c.in <- packet
+			c.op <- packet
 		}
 	}()
 	for {
-		select {
-		case packet := <-c.in:
-			switch msg := decode(packet).(type) {
-			case channelOpenConfirmMsg:
-				ch := c.channels[msg.PeersId]
-				ch.peerId = msg.MyId
-				ch.resp <- ch // send self back to requestor
-			case channelOpenFailureMsg:
-				ch := c.channels[msg.PeersId]
-				ch.resp <- os.NewError("failed")
-			case windowAdjustMsg:
-				ch := c.channels[msg.PeersId]
-				ch.resp <- msg
-			case channelRequestSuccessMsg:
-                                ch := c.channels[msg.PeersId]
-                                ch.resp <- msg
-			case channelRequestFailureMsg:
-                                ch := c.channels[msg.PeersId]
-                                ch.resp <- msg
-			case channelCloseMsg:
-                                ch := c.channels[msg.PeersId]
-                                ch.resp <- msg
+		switch in := (<- c.op).(type) {
+		case []byte:
+			// operation is a []byte, a raw message
+			switch msg := decode(in).(type) {
+			case channelMsg:
+				ch := c.channels[msg.peerId()]
+				ch <- msg 
 			default:
-				debug("mainloop: unhandled packet type", packet[0])
+				debug("mainloop: unhandled packet type", in[0])
 			}
-		case <-c.inErr:
+		case os.Error:
 			// on any error close the connection
-			c.stop <- true
-		case <-c.stop:
-			c.transport.Close()
-		case resp := <-c.openChannel:
-			id := c.nextChanId()
-			ch := &ClientChan{
-				client: c,
-				resp:   resp,
-			}
-			c.channels[id] = ch
-			if err := c.sendMessage(msgChannelOpen, channelOpenMsg{
-				ChanType:      "session",
-				PeersId:       id,
-				PeersWindow:   8192,
-				MaxPacketSize: 16384,
-			}); err != nil {
-				// remove channel reference
-				c.channels[id] = ch, false
-				resp <- err
-			}
+			defer c.Close()
+			return
+		case openChannelRequest:
+			
+		default:
+			panic("Unknown operation")
 		}
 	}
 }
@@ -139,10 +109,10 @@ func (c *Client) handshake() os.Error {
 	if _, err := c.transport.writer.Writer.Write(clientVersion); err != nil {
 		return err
 	}
-	c.magics.clientVersion = clientVersion[:len(serverVersion)-2]
+	c.magics.clientVersion = clientVersion[:len(clientVersion)-2]
 
-	// recv server version
-	version, ok := readVersion(c.transport.reader.Reader)
+	// read remote server version
+	version, ok := readVersion(c.transport)
 	if !ok {
 		return os.NewError("failed to read version string from string")
 	}
@@ -237,7 +207,6 @@ func (c *Client) handshake() os.Error {
 	if packet[0] != msgUserAuthSuccess {
 		return UnexpectedMessageError{msgUserAuthSuccess, packet[0]}
 	}
-
 	return nil
 }
 
@@ -318,129 +287,26 @@ func (c *Client) kexDH(group *dhGroup, hashFunc crypto.Hash, magics *handshakeMa
 	return
 }
 
-func (c *Client) OpenChannel() (*ClientChan, os.Error) {
-	resp := make(chan interface{}, 1) // response
-	c.openChannel <- resp
-	switch ch := <-resp; ch.(type) {
-	case *ClientChan:
-		return ch.(*ClientChan), nil
-	case os.Error:
-		return nil, ch.(os.Error)
+type openChannelRequest struct {
+	id uint32
+	c chan interface{}
+}
+
+func (c *Client) openChannel() (*channel, os.Error) {
+	r := make(chan interface{}, 16)
+	c.op <- openChannelRequest{ c.nextChanId(), r }
+	switch msg := (<- r).(type) {
+
 	}
-	panic("unpossible")
+	panic("Unknown message")
 }
 
 func (c *Client) Close() {
-	c.stop <- true
-}
-
-type ClientChan struct {
-	client *Client
-	peerId uint32
-	resp   chan interface{} // used for communicating the open msg
-}
-
-func (c *ClientChan) Close() os.Error {
-	if err := c.client.sendMessage(msgChannelClose, channelCloseMsg{
-		PeersId: c.peerId,
-	}); err != nil {
-		return err
-	}
-	switch resp := <-c.resp; resp.(type) {
-	case channelCloseMsg:
-		return nil
-	}
-	panic("error")
-}
-
-// Pass an environment variable to a channel to be applied
-// to any shell/command started later
-func (c *ClientChan) Setenv(name, value string) os.Error {
-	namLen := stringLength([]byte(name))
-	valLen := stringLength([]byte(value))
-	payload := make([]byte, namLen+valLen)
-	marshalString(payload[:namLen], []byte(name))
-	marshalString(payload[namLen:], []byte(value))
-
-	if err := c.client.sendMessage(msgChannelRequest, channelRequestMsg{
-		PeersId:             c.peerId,
-		Request:             "env",
-		WantReply:           true,
-		RequestSpecificData: payload,
-	}); err != nil {
-		return err
-	}
-	switch resp := <-c.resp; resp.(type) {
-	case channelRequestSuccessMsg:
-		return nil
-	case channelRequestFailureMsg:
-		return os.NewError("unable to set env var \"" + name + "\"")
-	}
-	panic("unreachable")
-}
-
-// Request a pty to be allocated on the remote side for this channel
-func (c *ClientChan) PtyReq(term string, h, w int) os.Error {
-	b := new(bytes.Buffer)
-	binary.Write(b, binary.BigEndian, uint32(len(term)))
-	binary.Write(b, binary.BigEndian, term)
-	binary.Write(b, binary.BigEndian, uint32(h))
-	binary.Write(b, binary.BigEndian, uint32(w))
-	binary.Write(b, binary.BigEndian, uint32(h*8))
-	binary.Write(b, binary.BigEndian, uint32(w*8))
-	b.Write([]byte{0, 0, 0, 1, 0, 0, 0, 0, 0}) // empty mode list
-
-	if err := c.client.sendMessage(msgChannelRequest, channelRequestMsg{
-		PeersId:             c.peerId,
-		Request:             "pty-req",
-		WantReply:           true,
-		RequestSpecificData: b.Bytes(),
-	}); err != nil {
-		return err
-	}
-	switch resp := <-c.resp; resp.(type) {
-	case channelRequestSuccessMsg:
-		return nil
-	case channelRequestFailureMsg:
-		return os.NewError("unable to request a pty")
-	}
-	panic("unreachable")
-}
-
-func (c *ClientChan) Exec(command string) os.Error {
-	cmdLen := stringLength([]byte(command))
-	payload := make([]byte, cmdLen)
-	marshalString(payload, []byte(command))
-	if err := c.client.sendMessage(msgChannelRequest, channelRequestMsg{
-		PeersId:             c.peerId,
-		Request:             "exec",
-		WantReply:           true,
-		RequestSpecificData: payload,
-	}); err != nil {
-		return err
-	}
-	switch resp := <-c.resp; resp.(type) {
-	case channelRequestSuccessMsg:
-		return nil
-	case channelRequestFailureMsg:
-		return os.NewError("unable to execure \"" + command + "\"")
-	}
-	panic("unreachable")
-}
-
-// Send a message to the remote peer
-func (t *transport) sendMessage(typ uint8, msg interface{}) os.Error {
-	packet := marshal(typ, msg)
-	return t.writePacket(packet)
+	c.transport.Close()
 }
 
 func debug(args ...interface{}) {
 	fmt.Println(args...)
-}
-
-type Config struct {
-	User     string
-	Password string // used for "password" method authentication
 }
 
 func decode(packet []byte) interface{} {

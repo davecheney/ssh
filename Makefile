@@ -8,11 +8,8 @@ TARG=exp/ssh
 GOFILES=\
 	client.go\
 	common.go\
-	exec.go\
 	messages.go\
-	server.go\
 	transport.go\
         channel.go\
-        server_shell.go\
 
 include ../../../Make.pkg

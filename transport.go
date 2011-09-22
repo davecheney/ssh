@@ -14,6 +14,11 @@ import (
 	"hash"
 	"io"
 	"os"
+	"sync"
+)
+
+const (
+	paddingMultiple = 16 // TODO(dfc) does this need to be configurable?
 )
 
 // transport represents the SSH connection to the remote peer.
@@ -28,19 +33,23 @@ type transport struct {
 	Close func() os.Error
 }
 
+// reader represents the incoming connection state.
 type reader struct {
-	*bufio.Reader
+	io.Reader
 	common
 }
 
+// writer represnts the outgoing connection state.
 type writer struct {
+	*sync.Mutex	// protects writer.Writer from concurrent writes
 	*bufio.Writer
 	paddingMultiple int
 	rand            io.Reader
 	common
 }
 
-// common represents the cipher state needed to process messages.
+// common represents the cipher state needed to process messages in a single
+// direction.
 type common struct {
 	seqNum uint32
 	mac    hash.Hash
@@ -103,8 +112,7 @@ func (r *reader) readOnePacket() ([]byte, os.Error) {
 	return packet[:length-paddingLength-1], nil
 }
 
-// read and decrypt next packet on the wire
-// discarding debug and noop messages
+// Read and decrypt next packet discarding debug and noop messages.
 func (t *transport) readPacket() ([]byte, os.Error) {
 	for {
 		packet, err := t.readOnePacket()
@@ -120,10 +128,8 @@ func (t *transport) readPacket() ([]byte, os.Error) {
 
 // Encrypt and send a packet of data to the remote peer.
 func (w *writer) writePacket(packet []byte) os.Error {
-	paddingMultiple := w.paddingMultiple
-	if paddingMultiple == 0 {
-		paddingMultiple = 8
-	}
+	w.Mutex.Lock()
+	defer w.Mutex.Unlock()
 
 	paddingLength := paddingMultiple - (5+len(packet))%paddingMultiple
 	if paddingLength < 4 {
@@ -189,12 +195,19 @@ func (w *writer) writePacket(packet []byte) os.Error {
 	return err
 }
 
+// Send a message to the remote peer
+func (t *transport) sendMessage(typ uint8, msg interface{}) os.Error {
+        packet := marshal(typ, msg)
+        return t.writePacket(packet)
+}
+
 type direction struct {
 	ivTag     []byte
 	keyTag    []byte
 	macKeyTag []byte
 }
 
+// TODO(dfc) can this be made a constant ?
 var (
 	serverKeys = direction{[]byte{'B'}, []byte{'D'}, []byte{'F'}}
 	clientKeys = direction{[]byte{'A'}, []byte{'C'}, []byte{'E'}}
@@ -282,16 +295,19 @@ func (t truncatingMAC) Size() int {
 // while searching for the end of the version handshake.
 const maxVersionStringBytes = 1024
 
-func readVersion(r *bufio.Reader) (versionString []byte, ok bool) {
+// Read version string as specified by RFC 4253, section 4.2.
+func readVersion(r io.Reader) (versionString []byte, ok bool) {
 	versionString = make([]byte, 0, 64)
 	seenCR := false
 
+	var buf [1]byte
 forEachByte:
 	for len(versionString) < maxVersionStringBytes {
-		b, err := r.ReadByte()
+		_, err := io.ReadFull(r, buf[:])
 		if err != nil {
 			return
 		}
+		b := buf[0]
 
 		if !seenCR {
 			if b == '\r' {
