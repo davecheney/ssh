@@ -111,11 +111,6 @@ type userAuthFailureMsg struct {
 	PartialSuccess bool
 }
 
-type channelMsg interface {
-	// The id of the remote message
-	peerId() uint32
-}
-
 // See RFC 4254, section 5.1.
 type channelOpenMsg struct {
 	ChanType         string
@@ -123,10 +118,6 @@ type channelOpenMsg struct {
 	PeersWindow      uint32
 	MaxPacketSize    uint32
 	TypeSpecificData []byte "rest"
-}
-
-func (c *channelOpenMsg) peerId() uint32 {
-	return c.PeersId
 }
 
 // See RFC 4254, section 5.1.

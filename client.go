@@ -36,32 +36,32 @@ func Dial(addr string, config Config) (*Client, os.Error) {
 
 func newClient(conn net.Conn, config Config) *Client {
 	return &Client{
-                transport: &transport{
-                        reader: reader{
-                                Reader: bufio.NewReader(conn),
-                        },
-                        writer: writer{
-                                Writer: bufio.NewWriter(conn),
-                                rand:   rand.Reader,
-				Mutex: new(sync.Mutex),
-                        },
-                        Close: func() os.Error {
-                                return conn.Close()
-                        },
-                },
-                Config:      config,
-                channels:    make(map[uint32]chan interface{}),
-		op:	make(chan interface{}, 4),
-        }
+		transport: &transport{
+			reader: reader{
+				Reader: bufio.NewReader(conn),
+			},
+			writer: writer{
+				Writer: bufio.NewWriter(conn),
+				rand:   rand.Reader,
+				Mutex:  new(sync.Mutex),
+			},
+			Close: func() os.Error {
+				return conn.Close()
+			},
+		},
+		Config:   config,
+		channels: make(map[uint32]chan interface{}),
+		op:       make(chan interface{}, 4),
+	}
 }
 
 type Client struct {
 	*transport
-	Config      Config
-	magics      handshakeMagics
-	channels    map[uint32]chan interface{}
-	op    chan interface{}
-	nextId      uint32                // net channel id
+	Config   Config
+	magics   handshakeMagics
+	channels map[uint32]chan interface{}
+	op       chan interface{}
+	nextId   uint32 // net channel id
 }
 
 func (c *Client) nextChanId() uint32 {
@@ -82,13 +82,31 @@ func (c *Client) mainloop() {
 		}
 	}()
 	for {
-		switch in := (<- c.op).(type) {
+		switch in := (<-c.op).(type) {
 		case []byte:
 			// operation is a []byte, a raw message
 			switch msg := decode(in).(type) {
-			case channelMsg:
-				ch := c.channels[msg.peerId()]
-				ch <- msg 
+			case channelOpenMsg:
+				ch := c.channels[msg.PeersId]
+				ch <- msg
+			case channelOpenConfirmMsg:
+				ch := c.channels[msg.PeersId]
+				ch <- msg
+			case channelOpenFailureMsg:
+				ch := c.channels[msg.PeersId]
+				ch <- msg
+			case channelCloseMsg:
+				ch := c.channels[msg.PeersId]
+				ch <- msg
+			case channelRequestSuccessMsg:
+				ch := c.channels[msg.PeersId]
+                                ch <- msg
+			case channelRequestMsg:
+                                ch := c.channels[msg.PeersId]
+                                ch <- msg
+			case windowAdjustMsg:
+                                ch := c.channels[msg.PeersId]
+                                ch <- msg
 			default:
 				debug("mainloop: unhandled packet type", in[0])
 			}
@@ -97,7 +115,18 @@ func (c *Client) mainloop() {
 			defer c.Close()
 			return
 		case openChannelRequest:
-			
+			// record channel 
+			c.channels[in.id] = in.c
+			if err := c.sendMessage(msgChannelOpen, channelOpenMsg{
+				ChanType:      "session",
+				PeersId:       in.id,
+				PeersWindow:   8192,
+				MaxPacketSize: 16384,
+			}); err != nil {
+				// remove channel reference
+				c.channels[in.id] = in.c, false
+				in.c <- err
+			}
 		default:
 			panic("Unknown operation")
 		}
@@ -289,14 +318,20 @@ func (c *Client) kexDH(group *dhGroup, hashFunc crypto.Hash, magics *handshakeMa
 
 type openChannelRequest struct {
 	id uint32
-	c chan interface{}
+	c  chan interface{}
 }
 
 func (c *Client) openChannel() (*channel, os.Error) {
 	r := make(chan interface{}, 16)
-	c.op <- openChannelRequest{ c.nextChanId(), r }
-	switch msg := (<- r).(type) {
-
+	c.op <- openChannelRequest{c.nextChanId(), r}
+	switch msg := (<-r).(type) {
+	case channelOpenConfirmMsg:
+		return &channel{
+			id:        msg.PeersId,
+			peerId:    msg.MyId,
+			in:        r,
+			transport: c.transport,
+		}, nil
 	}
 	panic("Unknown message")
 }

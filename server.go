@@ -560,7 +560,7 @@ const defaultWindowSize = 32768
 
 // Accept reads and processes messages on a ServerConnection. It must be called
 // in order to demultiplex messages to any resulting Channels.
-func (s *ServerConnection) Accept() (Channel, os.Error) {
+func (s *ServerConnection) Accept() (*channel, os.Error) {
 	if s.err != nil {
 		return nil, s.err
 	}

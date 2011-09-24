@@ -41,7 +41,7 @@ type reader struct {
 
 // writer represnts the outgoing connection state.
 type writer struct {
-	*sync.Mutex	// protects writer.Writer from concurrent writes
+	*sync.Mutex // protects writer.Writer from concurrent writes
 	*bufio.Writer
 	paddingMultiple int
 	rand            io.Reader
@@ -197,8 +197,8 @@ func (w *writer) writePacket(packet []byte) os.Error {
 
 // Send a message to the remote peer
 func (t *transport) sendMessage(typ uint8, msg interface{}) os.Error {
-        packet := marshal(typ, msg)
-        return t.writePacket(packet)
+	packet := marshal(typ, msg)
+	return t.writePacket(packet)
 }
 
 type direction struct {

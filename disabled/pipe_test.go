@@ -38,7 +38,7 @@ NsZoFj52ponUM6+99A2CmezFCN16c4mbA//luWF+k3VVqR6BpkrhKw==
 -----END RSA PRIVATE KEY-----`
 
 func xTestClientAndServer(t *testing.T) {
-        sconn, cconn := net.Pipe()
+	sconn, cconn := net.Pipe()
 	var s Server
 	s.NoClientAuth = true
 	if err := s.SetRSAPrivateKey([]byte(testPem)); err != nil {
@@ -54,8 +54,8 @@ func xTestClientAndServer(t *testing.T) {
 		t.Log("Server handshake complete")
 		sconn.Close()
 	}()
-	
-	if err := newClient(cconn, Config{User: "go"} ).handshake(); err != nil {
+
+	if err := newClient(cconn, Config{User: "go"}).handshake(); err != nil {
 		t.Error(err)
 	}
 	t.Log("Client handshake complete")

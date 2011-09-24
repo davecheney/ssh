@@ -11,7 +11,7 @@ import (
 // ServerShell contains the state for running a VT100 terminal that is capable
 // of reading lines of input.
 type ServerShell struct {
-	c      Channel
+	c      *channel
 	prompt string
 
 	// line is the current line being entered.
@@ -38,7 +38,7 @@ type ServerShell struct {
 
 // NewServerShell runs a VT100 terminal on the given channel. prompt is a
 // string that is written at the start of each input line. For example: "> ".
-func NewServerShell(c Channel, prompt string) *ServerShell {
+func NewServerShell(c channel, prompt string) *ServerShell {
 	return &ServerShell{
 		c:          c,
 		prompt:     prompt,
