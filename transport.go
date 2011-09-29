@@ -10,9 +10,11 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/subtle"
 	"hash"
 	"io"
+	"net"
 	"os"
 	"sync"
 )
@@ -30,7 +32,8 @@ type transport struct {
 	macAlgo         string
 	compressionAlgo string
 
-	Close func() os.Error
+	Close      func() os.Error
+	RemoteAddr func() net.Addr
 }
 
 // reader represents the incoming connection state.
@@ -195,10 +198,23 @@ func (w *writer) writePacket(packet []byte) os.Error {
 	return err
 }
 
-// Send a message to the remote peer
-func (t *transport) sendMessage(typ uint8, msg interface{}) os.Error {
-	packet := marshal(typ, msg)
-	return t.writePacket(packet)
+func newTransport(conn net.Conn) *transport {
+	return &transport{
+		reader: reader{
+			Reader: bufio.NewReader(conn),
+		},
+		writer: writer{
+			Writer: bufio.NewWriter(conn),
+			rand:   rand.Reader,
+			Mutex:  new(sync.Mutex),
+		},
+		Close: func() os.Error {
+			return conn.Close()
+		},
+		RemoteAddr: func() net.Addr {
+			return conn.RemoteAddr()
+		},
+	}
 }
 
 type direction struct {

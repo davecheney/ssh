@@ -57,7 +57,14 @@ const (
 // These structures mirror the wire format of the corresponding SSH messages.
 // They are marshaled using reflection with the marshal and unmarshal functions
 // in this file. The only wrinkle is that a final member of type []byte with a
-// tag of "rest" receives the remainder of a packet when unmarshaling.
+// ssh tag of "rest" receives the remainder of a packet when unmarshaling.
+
+// See RFC 4253, section 11.1.
+type disconnectMsg struct {
+	Reason   uint32
+	Message  string
+	Language string
+}
 
 // See RFC 4253, section 7.1.
 type kexInitMsg struct {
@@ -102,7 +109,7 @@ type userAuthRequestMsg struct {
 	User    string
 	Service string
 	Method  string
-	Payload []byte "rest"
+	Payload []byte `ssh:"rest"`
 }
 
 // See RFC 4252, section 5.1
@@ -117,7 +124,7 @@ type channelOpenMsg struct {
 	PeersId          uint32
 	PeersWindow      uint32
 	MaxPacketSize    uint32
-	TypeSpecificData []byte "rest"
+	TypeSpecificData []byte `ssh:"rest"`
 }
 
 // See RFC 4254, section 5.1.
@@ -126,7 +133,7 @@ type channelOpenConfirmMsg struct {
 	MyId             uint32
 	MyWindow         uint32
 	MaxPacketSize    uint32
-	TypeSpecificData []byte "rest"
+	TypeSpecificData []byte `ssh:"rest"`
 }
 
 // See RFC 4254, section 5.1.
@@ -137,11 +144,17 @@ type channelOpenFailureMsg struct {
 	Language string
 }
 
+// See RFC 4254, section 5.2.
+type channelData struct {
+	PeersId uint32
+	Payload []byte `ssh:"rest"`
+}
+
 type channelRequestMsg struct {
 	PeersId             uint32
 	Request             string
 	WantReply           bool
-	RequestSpecificData []byte "rest"
+	RequestSpecificData []byte `ssh:"rest"`
 }
 
 // See RFC 4254, section 5.4.
@@ -233,7 +246,7 @@ func unmarshal(out interface{}, packet []byte, expectedType uint8) os.Error {
 		case reflect.Slice:
 			switch t.Elem().Kind() {
 			case reflect.Uint8:
-				if structType.Field(i).Tag == "rest" {
+				if structType.Field(i).Tag.Get("ssh") == "rest" {
 					field.Set(reflect.ValueOf(packet))
 					packet = nil
 				} else {
@@ -315,7 +328,7 @@ func marshal(msgType uint8, msg interface{}) []byte {
 			switch t.Elem().Kind() {
 			case reflect.Uint8:
 				length := field.Len()
-				if structType.Field(i).Tag != "rest" {
+				if structType.Field(i).Tag.Get("ssh") != "rest" {
 					out = append(out, byte(length>>24))
 					out = append(out, byte(length>>16))
 					out = append(out, byte(length>>8))
@@ -555,3 +568,60 @@ func marshalString(to []byte, s []byte) []byte {
 }
 
 var bigIntType = reflect.TypeOf((*big.Int)(nil))
+
+// Decode a packet into it's corresponding message.
+func decode(packet []byte) interface{} {
+	var msg interface{}
+	switch packet[0] {
+	case msgDisconnect:
+		msg = new(disconnectMsg)
+	case msgServiceRequest:
+		msg = new(serviceRequestMsg)
+	case msgServiceAccept:
+		msg = new(serviceAcceptMsg)
+	case msgKexInit:
+		msg = new(kexInitMsg)
+	case msgKexDHInit:
+		msg = new(kexDHInitMsg)
+	case msgKexDHReply:
+		msg = new(kexDHReplyMsg)
+	case msgUserAuthRequest:
+		msg = new(userAuthRequestMsg)
+	case msgUserAuthFailure:
+		msg = new(userAuthFailureMsg)
+	case msgUserAuthPubKeyOk:
+		msg = new(userAuthPubKeyOkMsg)
+	case msgGlobalRequest:
+		msg = new(globalRequestMsg)
+	case msgRequestSuccess:
+		msg = new(channelRequestSuccessMsg)
+	case msgRequestFailure:
+		msg = new(channelRequestFailureMsg)
+	case msgChannelOpen:
+		msg = new(channelOpenMsg)
+	case msgChannelOpenConfirm:
+		msg = new(channelOpenConfirmMsg)
+	case msgChannelOpenFailure:
+		msg = new(channelOpenFailureMsg)
+	case msgChannelWindowAdjust:
+		msg = new(windowAdjustMsg)
+	case msgChannelData:
+		msg = new(channelData)
+	case msgChannelEOF:
+		msg = new(channelEOFMsg)
+	case msgChannelClose:
+		msg = new(channelCloseMsg)
+	case msgChannelRequest:
+		msg = new(channelRequestMsg)
+	case msgChannelSuccess:
+		msg = new(channelRequestSuccessMsg)
+	case msgChannelFailure:
+		msg = new(channelRequestFailureMsg)
+	default:
+		return UnexpectedMessageError{0, packet[0]}
+	}
+	if err := unmarshal(msg, packet, packet[0]); err != nil {
+		return err
+	}
+	return msg
+}

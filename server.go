@@ -6,7 +6,6 @@ package ssh
 
 import (
 	"big"
-	"bufio"
 	"bytes"
 	"crypto"
 	"crypto/rand"
@@ -261,18 +260,7 @@ func buildDataSignedForAuth(sessionId []byte, req userAuthRequestMsg, algo, pubK
 // Handshake performs an SSH transport and client authentication on the given ServerConnection.
 func (s *ServerConnection) Handshake(conn net.Conn) os.Error {
 	var magics handshakeMagics
-	s.transport = &transport{
-		reader: reader{
-			Reader: bufio.NewReader(conn),
-		},
-		writer: writer{
-			Writer: bufio.NewWriter(conn),
-			rand:   rand.Reader,
-		},
-		Close: func() os.Error {
-			return conn.Close()
-		},
-	}
+	s.transport = newTransport(conn)
 
 	if _, err := conn.Write(serverVersion); err != nil {
 		return err
@@ -560,7 +548,7 @@ const defaultWindowSize = 32768
 
 // Accept reads and processes messages on a ServerConnection. It must be called
 // in order to demultiplex messages to any resulting Channels.
-func (s *ServerConnection) Accept() (*channel, os.Error) {
+func (s *ServerConnection) Accept() (Channel, os.Error) {
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -581,19 +569,14 @@ func (s *ServerConnection) Accept() (*channel, os.Error) {
 			return nil, err
 		}
 
-		switch packet[0] {
-		case msgChannelOpen:
-			var chanOpen channelOpenMsg
-			if err := unmarshal(&chanOpen, packet, msgChannelOpen); err != nil {
-				return nil, err
-			}
-
+		switch msg := decode(packet).(type) {
+		case *channelOpenMsg:
 			c := new(channel)
-			c.chanType = chanOpen.ChanType
-			c.theirId = chanOpen.PeersId
-			c.theirWindow = chanOpen.PeersWindow
-			c.maxPacketSize = chanOpen.MaxPacketSize
-			c.extraData = chanOpen.TypeSpecificData
+			c.chanType = msg.ChanType
+			c.theirId = msg.PeersId
+			c.theirWindow = msg.PeersWindow
+			c.maxPacketSize = msg.MaxPacketSize
+			c.extraData = msg.TypeSpecificData
 			c.myWindow = defaultWindowSize
 			c.serverConn = s
 			c.cond = sync.NewCond(&c.lock)
@@ -606,74 +589,53 @@ func (s *ServerConnection) Accept() (*channel, os.Error) {
 			s.lock.Unlock()
 			return c, nil
 
-		case msgChannelRequest:
-			var chanRequest channelRequestMsg
-			if err := unmarshal(&chanRequest, packet, msgChannelRequest); err != nil {
-				return nil, err
-			}
-
+		case *channelRequestMsg:
 			s.lock.Lock()
-			c, ok := s.channels[chanRequest.PeersId]
+			c, ok := s.channels[msg.PeersId]
 			if !ok {
 				continue
 			}
-			c.handlePacket(&chanRequest)
+			c.handlePacket(msg)
 			s.lock.Unlock()
 
-		case msgChannelData:
-			if len(packet) < 5 {
-				return nil, ParseError{msgChannelData}
-			}
-			chanId := uint32(packet[1])<<24 | uint32(packet[2])<<16 | uint32(packet[3])<<8 | uint32(packet[4])
-
+		case *channelData:
 			s.lock.Lock()
-			c, ok := s.channels[chanId]
+			c, ok := s.channels[msg.PeersId]
 			if !ok {
 				continue
 			}
-			c.handleData(packet[9:])
+			c.handleData(msg.Payload)
 			s.lock.Unlock()
 
-		case msgChannelEOF:
-			var eofMsg channelEOFMsg
-			if err := unmarshal(&eofMsg, packet, msgChannelEOF); err != nil {
-				return nil, err
-			}
-
+		case *channelEOFMsg:
 			s.lock.Lock()
-			c, ok := s.channels[eofMsg.PeersId]
+			c, ok := s.channels[msg.PeersId]
 			if !ok {
 				continue
 			}
-			c.handlePacket(&eofMsg)
+			c.handlePacket(msg)
 			s.lock.Unlock()
 
-		case msgChannelClose:
-			var closeMsg channelCloseMsg
-			if err := unmarshal(&closeMsg, packet, msgChannelClose); err != nil {
-				return nil, err
-			}
-
+		case *channelCloseMsg:
 			s.lock.Lock()
-			c, ok := s.channels[closeMsg.PeersId]
+			c, ok := s.channels[msg.PeersId]
 			if !ok {
 				continue
 			}
-			c.handlePacket(&closeMsg)
+			c.handlePacket(msg)
 			s.lock.Unlock()
 
-		case msgGlobalRequest:
-			var request globalRequestMsg
-			if err := unmarshal(&request, packet, msgGlobalRequest); err != nil {
-				return nil, err
-			}
-
-			if request.WantReply {
+		case *globalRequestMsg:
+			if msg.WantReply {
 				if err := s.writePacket([]byte{msgRequestFailure}); err != nil {
 					return nil, err
 				}
 			}
 
+		case UnexpectedMessageError:
+			return nil, msg
+		case *disconnectMsg:
+			return nil, os.EOF
 		default:
 			// Unknown message. Ignore.
 		}
