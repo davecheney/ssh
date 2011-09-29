@@ -198,6 +198,12 @@ func (w *writer) writePacket(packet []byte) os.Error {
 	return err
 }
 
+// Send a message to the remote peer
+func (t *transport) sendMessage(typ uint8, msg interface{}) os.Error {
+	packet := marshal(typ, msg)
+	return t.writePacket(packet)
+}
+
 func newTransport(conn net.Conn) *transport {
 	return &transport{
 		reader: reader{

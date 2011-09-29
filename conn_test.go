@@ -38,8 +38,16 @@ NsZoFj52ponUM6+99A2CmezFCN16c4mbA//luWF+k3VVqR6BpkrhKw==
 -----END RSA PRIVATE KEY-----`
 
 var (
-	config = &Config{
+	serverConfig = &ServerConfig{
 		NoClientAuth:          true,
+		SupportedKexAlgos:     supportedKexAlgos,
+		SupportedHostKeyAlgos: supportedHostKeyAlgos,
+		SupportedCiphers:      supportedCiphers,
+		SupportedMACs:         supportedMACs,
+		SupportedCompressions: supportedCompressions,
+	}
+
+	clientConfig = &ClientConfig{
 		SupportedKexAlgos:     supportedKexAlgos,
 		SupportedHostKeyAlgos: supportedHostKeyAlgos,
 		SupportedCiphers:      supportedCiphers,
@@ -51,7 +59,7 @@ var (
 )
 
 func init() {
-	config.SetRSAPrivateKey([]byte(PEM))
+	serverConfig.SetRSAPrivateKey([]byte(PEM))
 }
 
 // shabby bufferedPipe implementation to avoid the 
@@ -88,11 +96,10 @@ func bufferedPipe() (net.Conn, net.Conn) {
 // loopback socket
 func TestClientServerPipeConn(t *testing.T) {
 	c, s := bufferedPipe()
-	client, server := newConn(c, config), newConn(s, config)
+	client, server := newClientConn(c, clientConfig), newServerConn(s, serverConfig)
 	defer client.Close()
 	defer server.Close()
 	go func() {
-		server.isServer = true
 		if err := server.Handshake(); err != nil {
 			t.Fatal("error: serverHandshake:", err)
 		}
@@ -104,7 +111,7 @@ func TestClientServerPipeConn(t *testing.T) {
 
 // test Listen/Dial functionality
 func TestClientServerNetConn(t *testing.T) {
-	l, err := Listen("localhost:0", config)
+	l, err := Listen("localhost:0", serverConfig)
 	if err != nil {
 		t.Fatal("error listening on loopback:", err)
 	}
@@ -119,7 +126,7 @@ func TestClientServerNetConn(t *testing.T) {
 			t.Fatal("error: serverHandshake:", err)
 		}
 	}()
-	c, err := Dial(l.Addr().String(), config)
+	c, err := Dial(l.Addr().String(), clientConfig)
 	if err != nil {
 		t.Fatal("error connecting to server socket:", err)
 	}

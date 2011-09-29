@@ -19,41 +19,78 @@ import (
 // the Client and Server will use.
 var versionString = []byte("SSH-2.0-Go\r\n")
 
-// An ssh.Conn represents one end of a multiplexed ssh connection.
-type Conn struct {
+// A Conn represents one end of a multiplexed ssh connection.
+type Conn interface {
+
+	// Complete the handshake process and make the connection
+	// ready to process data.
+	Handshake() os.Error
+
+	// Close the connection.
+	Close() os.Error
+}
+
+// Represents the client side of a ssh connection.
+type clientConn struct {
+	conn
+	config *ClientConfig
+}
+
+// Represents the server side of a ssh connection.
+type serverConn struct {
+	conn
+	config *ServerConfig
+}
+
+// Common methods and fields for client and server connections
+type conn struct {
 	*transport
-	config   *Config
-	isServer bool
 	channels map[uint32]*channel
 }
 
-func newConn(c net.Conn, config *Config) *Conn {
-	conn := &Conn{
-		transport: newTransport(c),
-		config:    config,
-		channels:  make(map[uint32]*channel),
+func (c *conn) Close() os.Error {
+	return c.transport.Close()
+}
+
+func (c *conn) sendVersion(version []byte) os.Error {
+	if _, err := c.Write(version); err != nil {
+		return err
+	}
+	return c.Flush()
+}
+
+// Construct a new Conn in client mode.
+func newClientConn(c net.Conn, config *ClientConfig) Conn {
+	conn := &clientConn{
+		conn: conn{
+			transport: newTransport(c),
+			channels:  make(map[uint32]*channel),
+		},
+		config: config,
 	}
 	return conn
 }
 
-func (c *Conn) Handshake() os.Error {
-	if c.isServer {
-		return c.serverHandshake()
+// Construct a new Conn in server mode.
+func newServerConn(c net.Conn, config *ServerConfig) Conn {
+	conn := &serverConn{
+		conn: conn{
+			transport: newTransport(c),
+			channels:  make(map[uint32]*channel),
+		},
+		config: config,
 	}
-	return c.clientHandshake()
+	return conn
 }
 
-func (c *Conn) serverHandshake() os.Error {
+func (c *serverConn) Handshake() os.Error {
 	var magics handshakeMagics
-	if _, err := c.Write(versionString); err != nil {
-		return err
-	}
-	if err := c.Flush(); err != nil {
+	if err := c.sendVersion(versionString); err != nil {
 		return err
 	}
 	magics.serverVersion = versionString[:len(versionString)-2]
 
-	version, ok := readVersion(c.transport)
+	version, ok := readVersion(c)
 	if !ok {
 		return os.NewError("failed to read version string from client")
 	}
@@ -96,8 +133,7 @@ func (c *Conn) serverHandshake() os.Error {
 	if clientKexInit.FirstKexFollows && kexAlgo != clientKexInit.KexAlgos[0] {
 		// The client sent a Kex message for the wrong algorithm,
 		// which we have to ignore.
-		_, err := c.readPacket()
-		if err != nil {
+		if _, err := c.readPacket(); err != nil {
 			return err
 		}
 	}
@@ -108,7 +144,7 @@ func (c *Conn) serverHandshake() os.Error {
 	case kexAlgoDH14SHA1:
 		hashFunc = crypto.SHA1
 		dhGroup14Once.Do(initDHGroup14)
-		H, K, err = c.serverKexDH(dhGroup14, hashFunc, &magics, hostKeyAlgo)
+		H, K, err = c.kexDH(dhGroup14, hashFunc, &magics, hostKeyAlgo)
 	default:
 		err = os.NewError("ssh: internal error")
 	}
@@ -162,9 +198,9 @@ func (c *Conn) serverHandshake() os.Error {
 	return nil
 }
 
-// serverKexDH performs Diffie-Hellman key agreement on a ServerConnection. The
+// KexDH performs Diffie-Hellman key agreement on a ServerConnection. The
 // returned values are given the same names as in RFC 4253, section 8.
-func (c *Conn) serverKexDH(group *dhGroup, hashFunc crypto.Hash, magics *handshakeMagics, hostKeyAlgo string) (H, K []byte, err os.Error) {
+func (c *serverConn) kexDH(group *dhGroup, hashFunc crypto.Hash, magics *handshakeMagics, hostKeyAlgo string) (H, K []byte, err os.Error) {
 	packet, err := c.readPacket()
 	if err != nil {
 		return
@@ -230,13 +266,11 @@ func (c *Conn) serverKexDH(group *dhGroup, hashFunc crypto.Hash, magics *handsha
 		Y:         Y,
 		Signature: serializedSig,
 	}
-	packet = marshal(msgKexDHReply, kexDHReply)
-
-	err = c.writePacket(packet)
+	err = c.writePacket(marshal(msgKexDHReply, kexDHReply))
 	return
 }
 
-func (c *Conn) authenticate(H []byte) os.Error {
+func (c *serverConn) authenticate(H []byte) os.Error {
 	var userAuthReq userAuthRequestMsg
 	var err os.Error
 	var packet []byte
@@ -373,25 +407,23 @@ userAuthLoop:
 }
 
 // testPubKey returns true if the given public key is acceptable for the user.
-func (c *Conn) testPubKey(user, algo string, pubKey []byte) bool {
+func (c *serverConn) testPubKey(user, algo string, pubKey []byte) bool {
 	result := c.config.PubKeyCallback(user, algo, pubKey)
 	return result
 }
 
-func (c *Conn) clientHandshake() os.Error {
+func (c *clientConn) Handshake() os.Error {
 	var magics handshakeMagics
 
 	// send client version
-	if _, err := c.transport.Write(versionString); err != nil {
+	if err := c.sendVersion(versionString); err != nil {
 		return err
 	}
-	if err := c.transport.Flush(); err != nil {
-		return err
-	}
+
 	magics.clientVersion = versionString[:len(versionString)-2]
 
 	// read remote server version
-	version, ok := readVersion(c.transport)
+	version, ok := readVersion(c)
 	if !ok {
 		return os.NewError("failed to read version string from string")
 	}
@@ -445,7 +477,7 @@ func (c *Conn) clientHandshake() os.Error {
 	case kexAlgoDH14SHA1:
 		hashFunc = crypto.SHA1
 		dhGroup14Once.Do(initDHGroup14)
-		H, K, err = c.clientKexDH(dhGroup14, hashFunc, &magics, hostKeyAlgo)
+		H, K, err = c.kexDH(dhGroup14, hashFunc, &magics, hostKeyAlgo)
 	default:
 		err = os.NewError("ssh: internal error")
 	}
@@ -496,15 +528,15 @@ func (c *Conn) clientHandshake() os.Error {
 	return nil
 }
 
-func (c *Conn) sendServiceReq(name string) os.Error {
+func (c *clientConn) sendServiceReq(name string) os.Error {
 	packet := marshal(msgServiceRequest, serviceRequestMsg{name})
 	return c.writePacket(packet)
 }
 
-func (c *Conn) sendUserAuthReq(method string) os.Error {
+func (c *clientConn) sendUserAuthReq(method string) os.Error {
 	length := stringLength([]byte(c.config.Password)) + 1
 	payload := make([]byte, length)
-	marshalString(payload[1:], []byte(c.config.Password)) // payload[0] == 0 == boolean:false
+	marshalString(payload[1:], []byte(c.config.Password)) // payload[0] = boolean:false
 
 	return c.writePacket(marshal(msgUserAuthRequest, userAuthRequestMsg{
 		User:    c.config.User,
@@ -514,9 +546,9 @@ func (c *Conn) sendUserAuthReq(method string) os.Error {
 	}))
 }
 
-// clientKexDH performs Diffie-Hellman key agreement on a ClientConnection. The
+// kexDH performs Diffie-Hellman key agreement on a ClientConnection. The
 // returned values are given the same names as in RFC 4253, section 8.
-func (c *Conn) clientKexDH(group *dhGroup, hashFunc crypto.Hash, magics *handshakeMagics, hostKeyAlgo string) ([]byte, []byte, os.Error) {
+func (c *clientConn) kexDH(group *dhGroup, hashFunc crypto.Hash, magics *handshakeMagics, hostKeyAlgo string) ([]byte, []byte, os.Error) {
 	x, err := rand.Int(rand.Reader, group.p)
 	if err != nil {
 		return nil, nil, err
@@ -561,13 +593,13 @@ func (c *Conn) clientKexDH(group *dhGroup, hashFunc crypto.Hash, magics *handsha
 	return H, K, nil
 }
 
-func Dial(addr string, config *Config) (*Conn, os.Error) {
+func Dial(addr string, config *ClientConfig) (Conn, os.Error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	client := newConn(conn, config)
-	if err := client.clientHandshake(); err != nil {
+	client := newClientConn(conn, config)
+	if err := client.Handshake(); err != nil {
 		defer client.Close()
 		return nil, err
 	}
@@ -576,19 +608,18 @@ func Dial(addr string, config *Config) (*Conn, os.Error) {
 
 type Listener struct {
 	listener net.Listener
-	config   *Config
+	config   *ServerConfig
 }
 
-// Accept waits for and returns the next incoming SSH connection.
+// Accept waits for and returns the next incoming ssh connection.
 // The reciever should call Handshake() in another
 // goroutine to avoid blocking the accepter
-func (l *Listener) Accept() (*Conn, os.Error) {
+func (l *Listener) Accept() (Conn, os.Error) {
 	c, err := l.listener.Accept()
 	if err != nil {
 		return nil, err
 	}
-	conn := newConn(c, l.config)
-	conn.isServer = true
+	conn := newServerConn(c, l.config)
 	return conn, nil
 }
 
@@ -596,12 +627,14 @@ func (l *Listener) Addr() net.Addr {
 	return l.listener.Addr()
 }
 
-// Close closes the listener.
+// Close the listener.
 func (l *Listener) Close() os.Error {
 	return l.listener.Close()
 }
 
-func Listen(laddr string, config *Config) (*Listener, os.Error) {
+// Open a new tcp socket on laddr and return a listener
+// which can be used to Accept incoming ssh connections.
+func Listen(laddr string, config *ServerConfig) (*Listener, os.Error) {
 	l, err := net.Listen("tcp", laddr)
 	if err != nil {
 		return nil, err
@@ -612,7 +645,18 @@ func Listen(laddr string, config *Config) (*Listener, os.Error) {
 	}, nil
 }
 
-type Config struct {
+// A ClientConfig structure is used to configure a ssh client. After one
+// has been passed to a TLS function it must not be modified.
+type ClientConfig struct {
+	User     string
+	Password string // used for "password" method authentication
+
+	SupportedKexAlgos, SupportedHostKeyAlgos, SupportedCiphers, SupportedMACs, SupportedCompressions []string
+}
+
+// A ServerConfig structure is used to configure a ssh listener. After one
+// has been passed to a TLS function it must not be modified.
+type ServerConfig struct {
 	rsa           *rsa.PrivateKey
 	rsaSerialized []byte
 
@@ -630,9 +674,6 @@ type Config struct {
 	// valid for the given user.
 	PubKeyCallback func(user, algo string, pubkey []byte) bool
 
-	User     string
-	Password string // used for "password" method authentication
-
 	SupportedKexAlgos, SupportedHostKeyAlgos, SupportedCiphers, SupportedMACs, SupportedCompressions []string
 }
 
@@ -640,7 +681,7 @@ type Config struct {
 // private key configured in order to accept connections. The private key must
 // be in the form of a PEM encoded, PKCS#1, RSA private key. The file "id_rsa"
 // typically contains such a key.
-func (c *Config) SetRSAPrivateKey(pemBytes []byte) os.Error {
+func (c *ServerConfig) SetRSAPrivateKey(pemBytes []byte) os.Error {
 	block, _ := pem.Decode(pemBytes)
 	if block == nil {
 		return os.NewError("ssh: no key found")
