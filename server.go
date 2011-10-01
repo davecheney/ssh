@@ -18,45 +18,6 @@ import (
 	"sync"
 )
 
-// Server represents an SSH server. A Server may have several ServerConnections.
-type Server struct {
-	rsa           *rsa.PrivateKey
-	rsaSerialized []byte
-
-	// NoClientAuth is true if clients are allowed to connect without
-	// authenticating.
-	NoClientAuth bool
-
-	// PasswordCallback, if non-nil, is called when a user attempts to
-	// authenticate using a password. It may be called concurrently from
-	// several goroutines.
-	PasswordCallback func(user, password string) bool
-
-	// PubKeyCallback, if non-nil, is called when a client attempts public
-	// key authentication. It must return true iff the given public key is
-	// valid for the given user.
-	PubKeyCallback func(user, algo string, pubkey []byte) bool
-}
-
-// SetRSAPrivateKey sets the private key for a Server. A Server must have a
-// private key configured in order to accept connections. The private key must
-// be in the form of a PEM encoded, PKCS#1, RSA private key. The file "id_rsa"
-// typically contains such a key.
-func (s *Server) SetRSAPrivateKey(pemBytes []byte) os.Error {
-	block, _ := pem.Decode(pemBytes)
-	if block == nil {
-		return os.NewError("ssh: no key found")
-	}
-	var err os.Error
-	s.rsa, err = x509.ParsePKCS1PrivateKey(block.Bytes)
-	if err != nil {
-		return err
-	}
-
-	s.rsaSerialized = marshalRSA(s.rsa)
-	return nil
-}
-
 // marshalRSA serializes an RSA private key according to RFC 4256, section 6.6.
 func marshalRSA(priv *rsa.PrivateKey) []byte {
 	e := new(big.Int).SetInt64(int64(priv.E))
@@ -119,10 +80,9 @@ type cachedPubKey struct {
 const maxCachedPubKeys = 16
 
 // ServerConnection represents an incomming connection to a Server.
-type ServerConnection struct {
-	Server *Server
-
+type ServerConn struct {
 	*transport
+	config	*ServerConfig
 
 	channels   map[uint32]*channel
 	nextChanId uint32
@@ -139,9 +99,19 @@ type ServerConnection struct {
 	cachedPubKeys []cachedPubKey
 }
 
+// Construct a new Conn in server mode.
+func newServerConn(c net.Conn, config *ServerConfig) *ServerConn {
+        conn := &ServerConn{
+                transport: newTransport(c),
+                channels:  make(map[uint32]*channel),
+                config: config,
+        }
+        return conn
+}
+
 // kexDH performs Diffie-Hellman key agreement on a ServerConnection. The
 // returned values are given the same names as in RFC 4253, section 8.
-func (s *ServerConnection) kexDH(group *dhGroup, hashFunc crypto.Hash, magics *handshakeMagics, hostKeyAlgo string) (H, K []byte, err os.Error) {
+func (s *ServerConn) kexDH(group *dhGroup, hashFunc crypto.Hash, magics *handshakeMagics, hostKeyAlgo string) (H, K []byte, err os.Error) {
 	packet, err := s.readPacket()
 	if err != nil {
 		return
@@ -166,7 +136,7 @@ func (s *ServerConnection) kexDH(group *dhGroup, hashFunc crypto.Hash, magics *h
 	var serializedHostKey []byte
 	switch hostKeyAlgo {
 	case hostAlgoRSA:
-		serializedHostKey = s.Server.rsaSerialized
+		serializedHostKey = s.config.rsaSerialized
 	default:
 		return nil, nil, os.NewError("internal error")
 	}
@@ -192,7 +162,7 @@ func (s *ServerConnection) kexDH(group *dhGroup, hashFunc crypto.Hash, magics *h
 	var sig []byte
 	switch hostKeyAlgo {
 	case hostAlgoRSA:
-		sig, err = rsa.SignPKCS1v15(rand.Reader, s.Server.rsa, hashFunc, hh)
+		sig, err = rsa.SignPKCS1v15(rand.Reader, s.config.rsa, hashFunc, hh)
 		if err != nil {
 			return
 		}
@@ -257,8 +227,8 @@ func buildDataSignedForAuth(sessionId []byte, req userAuthRequestMsg, algo, pubK
 	return ret
 }
 
-// Handshake performs an SSH transport and client authentication on the given ServerConnection.
-func (s *ServerConnection) Handshake(conn net.Conn) os.Error {
+// Handshake performs an SSH transport and client authentication on the given ServerConn.
+func (s *ServerConn) Handshake(conn net.Conn) os.Error {
 	var magics handshakeMagics
 	s.transport = newTransport(conn)
 
@@ -302,7 +272,7 @@ func (s *ServerConnection) Handshake(conn net.Conn) os.Error {
 		return err
 	}
 
-	kexAlgo, hostKeyAlgo, ok := findAgreedAlgorithms(s.transport, s.transport, &clientKexInit, &serverKexInit)
+	kexAlgo, hostKeyAlgo, ok := findAgreedAlgorithms(s.transport, &clientKexInit, &serverKexInit)
 	if !ok {
 		return os.NewError("ssh: no common algorithms")
 	}
@@ -382,8 +352,8 @@ func isAcceptableAlgo(algo string) bool {
 }
 
 // testPubKey returns true if the given public key is acceptable for the user.
-func (s *ServerConnection) testPubKey(user, algo string, pubKey []byte) bool {
-	if s.Server.PubKeyCallback == nil || !isAcceptableAlgo(algo) {
+func (s *ServerConn) testPubKey(user, algo string, pubKey []byte) bool {
+	if s.config.PubKeyCallback == nil || !isAcceptableAlgo(algo) {
 		return false
 	}
 
@@ -393,7 +363,7 @@ func (s *ServerConnection) testPubKey(user, algo string, pubKey []byte) bool {
 		}
 	}
 
-	result := s.Server.PubKeyCallback(user, algo, pubKey)
+	result := s.config.PubKeyCallback(user, algo, pubKey)
 	if len(s.cachedPubKeys) < maxCachedPubKeys {
 		c := cachedPubKey{
 			user:   user,
@@ -408,7 +378,7 @@ func (s *ServerConnection) testPubKey(user, algo string, pubKey []byte) bool {
 	return result
 }
 
-func (s *ServerConnection) authenticate(H []byte) os.Error {
+func (s *ServerConn) authenticate(H []byte) os.Error {
 	var userAuthReq userAuthRequestMsg
 	var err os.Error
 	var packet []byte
@@ -428,11 +398,11 @@ userAuthLoop:
 
 		switch userAuthReq.Method {
 		case "none":
-			if s.Server.NoClientAuth {
+			if s.config.NoClientAuth {
 				break userAuthLoop
 			}
 		case "password":
-			if s.Server.PasswordCallback == nil {
+			if s.config.PasswordCallback == nil {
 				break
 			}
 			payload := userAuthReq.Payload
@@ -445,11 +415,11 @@ userAuthLoop:
 				return ParseError{msgUserAuthRequest}
 			}
 
-			if s.Server.PasswordCallback(userAuthReq.User, string(password)) {
+			if s.config.PasswordCallback(userAuthReq.User, string(password)) {
 				break userAuthLoop
 			}
 		case "publickey":
-			if s.Server.PubKeyCallback == nil {
+			if s.config.PubKeyCallback == nil {
 				break
 			}
 			payload := userAuthReq.Payload
@@ -520,10 +490,10 @@ userAuthLoop:
 		}
 
 		var failureMsg userAuthFailureMsg
-		if s.Server.PasswordCallback != nil {
+		if s.config.PasswordCallback != nil {
 			failureMsg.Methods = append(failureMsg.Methods, "password")
 		}
-		if s.Server.PubKeyCallback != nil {
+		if s.config.PubKeyCallback != nil {
 			failureMsg.Methods = append(failureMsg.Methods, "publickey")
 		}
 
@@ -546,9 +516,9 @@ userAuthLoop:
 
 const defaultWindowSize = 32768
 
-// Accept reads and processes messages on a ServerConnection. It must be called
+// Accept reads and processes messages on a ServerConn. It must be called
 // in order to demultiplex messages to any resulting Channels.
-func (s *ServerConnection) Accept() (Channel, os.Error) {
+func (s *ServerConn) Accept() (Channel, os.Error) {
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -641,4 +611,83 @@ func (s *ServerConnection) Accept() (Channel, os.Error) {
 	}
 
 	panic("unreachable")
+}
+
+type ServerConfig struct {
+        rsa           *rsa.PrivateKey
+        rsaSerialized []byte
+
+        // NoClientAuth is true if clients are allowed to connect without
+        // authenticating.
+        NoClientAuth bool
+
+        // PasswordCallback, if non-nil, is called when a user attempts to
+        // authenticate using a password. It may be called concurrently from
+        // several goroutines.
+        PasswordCallback func(user, password string) bool
+
+        // PubKeyCallback, if non-nil, is called when a client attempts public
+        // key authentication. It must return true iff the given public key is
+        // valid for the given user.
+        PubKeyCallback func(user, algo string, pubkey []byte) bool
+
+        SupportedKexAlgos, SupportedHostKeyAlgos, SupportedCiphers, SupportedMACs, SupportedCompressions []string
+}
+
+// SetRSAPrivateKey sets the private key for a Server. A Server must have a
+// private key configured in order to accept connections. The private key must
+// be in the form of a PEM encoded, PKCS#1, RSA private key. The file "id_rsa"
+// typically contains such a key.
+func (c *ServerConfig) SetRSAPrivateKey(pemBytes []byte) os.Error {
+        block, _ := pem.Decode(pemBytes)
+        if block == nil {
+                return os.NewError("ssh: no key found")
+        }
+        var err os.Error
+        c.rsa, err = x509.ParsePKCS1PrivateKey(block.Bytes)
+        if err != nil {
+                return err
+        }
+
+        c.rsaSerialized = marshalRSA(c.rsa)
+        return nil
+}
+
+type Listener struct {
+        listener net.Listener
+        config   *ServerConfig
+}
+
+// Accept waits for and returns the next incoming ssh connection.
+// The reciever should call Handshake() in another
+// goroutine to avoid blocking the accepter
+func (l *Listener) Accept() (*ServerConn, os.Error) {
+        c, err := l.listener.Accept()
+        if err != nil {
+                return nil, err
+        }
+        conn := newServerConn(c, l.config)
+        return conn, nil
+}
+
+func (l *Listener) Addr() net.Addr {
+        return l.listener.Addr()
+}
+
+// Close the listener.
+func (l *Listener) Close() os.Error {
+        return l.listener.Close()
+}
+
+// Open a new tcp socket on laddr and return a listener
+// which can be used to Accept incoming ssh connections.
+func Listen(laddr string, config *ServerConfig) (*Listener, os.Error) {
+        l, err := net.Listen("tcp", laddr)
+        if err != nil {
+                return nil, err
+        }
+        return &Listener{
+                l,
+                config,
+        }, nil
 }

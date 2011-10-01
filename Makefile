@@ -9,7 +9,6 @@ GOFILES=\
 	channel.go\
 	client.go\
 	common.go\
-	conn.go\
 	messages.go\
 	transport.go\
 	server.go\

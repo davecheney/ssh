@@ -20,10 +20,6 @@ type Channel interface {
 	// peer is likely to signal a protocol error and drop the connection.
 	Reject(reason RejectionReason, message string) os.Error
 
-	io.Reader
-	io.Writer
-	io.Closer
-
 	// AckRequest either sends an ack or nack to the channel request.
 	AckRequest(ok bool) os.Error
 
@@ -33,6 +29,8 @@ type Channel interface {
 	// ExtraData returns the arbitary payload for this channel, as supplied
 	// by the client. This data is specific to the channel type.
 	ExtraData() []byte
+
+	io.ReadWriteCloser
 }
 
 // ChannelRequest represents a request sent on a channel, outside of the normal
@@ -137,10 +135,6 @@ func (c *channel) handleData(data []byte) {
 }
 
 func (c *channel) Read(data []byte) (n int, err os.Error) {
-	if c.err != nil {
-		return 0, c.err
-	}
-
 	if c.myWindow <= uint32(len(c.pendingData))/2 {
 		packet := marshal(msgChannelWindowAdjust, windowAdjustMsg{
 			PeersId:         c.theirId,

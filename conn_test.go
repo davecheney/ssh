@@ -104,7 +104,7 @@ func TestClientServerPipeConn(t *testing.T) {
 			t.Fatal("error: serverHandshake:", err)
 		}
 	}()
-	if err := client.Handshake(); err != nil {
+	if err := client.handshake(); err != nil {
 		t.Fatal("error: clientHandshake:", err)
 	}
 }

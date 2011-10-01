@@ -30,10 +30,6 @@ type transport struct {
 
 	io.Closer
 
-	cipherAlgo      string
-	macAlgo         string
-	compressionAlgo string
-
 	RemoteAddr func() net.Addr
 }
 
@@ -58,6 +54,11 @@ type common struct {
 	seqNum uint32
 	mac    hash.Hash
 	cipher cipher.Stream
+
+        cipherAlgo      string
+        macAlgo         string
+        compressionAlgo string
+
 }
 
 // Read and decrypt a single packet from the remote peer.
