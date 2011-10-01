@@ -578,8 +578,7 @@ func (s *ServerConnection) Accept() (Channel, os.Error) {
 			c.maxPacketSize = msg.MaxPacketSize
 			c.extraData = msg.TypeSpecificData
 			c.myWindow = defaultWindowSize
-			c.serverConn = s
-			c.cond = sync.NewCond(&c.lock)
+			c.transport = s.transport
 			c.pendingData = make([]byte, c.myWindow)
 
 			s.lock.Lock()

@@ -28,11 +28,12 @@ type transport struct {
 	reader
 	writer
 
+	io.Closer
+
 	cipherAlgo      string
 	macAlgo         string
 	compressionAlgo string
 
-	Close      func() os.Error
 	RemoteAddr func() net.Addr
 }
 
@@ -214,9 +215,7 @@ func newTransport(conn net.Conn) *transport {
 			rand:   rand.Reader,
 			Mutex:  new(sync.Mutex),
 		},
-		Close: func() os.Error {
-			return conn.Close()
-		},
+		Closer: conn,
 		RemoteAddr: func() net.Addr {
 			return conn.RemoteAddr()
 		},

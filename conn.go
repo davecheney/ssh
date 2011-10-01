@@ -7,10 +7,11 @@ package ssh
 import (
 	"big"
 	"crypto"
-	"encoding/pem"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/pem"
+	"io"
 	"os"
 	"net"
 )
@@ -26,8 +27,9 @@ type Conn interface {
 	// ready to process data.
 	Handshake() os.Error
 
-	// Close the connection.
-	Close() os.Error
+	Accept() (Channel, os.Error)
+
+	io.Closer
 }
 
 // Represents the client side of a ssh connection.
@@ -45,11 +47,8 @@ type serverConn struct {
 // Common methods and fields for client and server connections
 type conn struct {
 	*transport
-	channels map[uint32]*channel
-}
-
-func (c *conn) Close() os.Error {
-	return c.transport.Close()
+	nextChanId uint32
+	channels   map[uint32]*channel
 }
 
 func (c *conn) sendVersion(version []byte) os.Error {
@@ -57,6 +56,84 @@ func (c *conn) sendVersion(version []byte) os.Error {
 		return err
 	}
 	return c.Flush()
+}
+
+// Accept reads and processes messages on a Conn. It must be called
+// in order to demultiplex messages to any resulting Channels.
+func (s *conn) Accept() (Channel, os.Error) {
+	for {
+		packet, err := s.readPacket()
+		if err != nil {
+			for _, c := range s.channels {
+				c.dead = true
+				c.handleData(nil)
+			}
+
+			return nil, err
+		}
+
+		switch msg := decode(packet).(type) {
+		case *channelOpenMsg:
+			c := &channel{
+				chanType:      msg.ChanType,
+				theirId:       msg.PeersId,
+				theirWindow:   msg.PeersWindow,
+				maxPacketSize: msg.MaxPacketSize,
+				extraData:     msg.TypeSpecificData,
+				myWindow:      defaultWindowSize,
+				transport:     s.transport,
+				pendingData:   make([]byte, defaultWindowSize),
+				myId:          s.nextChanId,
+			}
+			s.nextChanId++
+			s.channels[c.myId] = c
+			return c, nil
+
+		case *channelRequestMsg:
+			c, ok := s.channels[msg.PeersId]
+			if !ok {
+				continue
+			}
+			c.handlePacket(msg)
+
+		case *channelData:
+			c, ok := s.channels[msg.PeersId]
+			if !ok {
+				continue
+			}
+			c.handleData(msg.Payload)
+
+		case *channelEOFMsg:
+			c, ok := s.channels[msg.PeersId]
+			if !ok {
+				continue
+			}
+			c.handlePacket(msg)
+
+		case *channelCloseMsg:
+			c, ok := s.channels[msg.PeersId]
+			if !ok {
+				continue
+			}
+			c.handlePacket(msg)
+
+		case *globalRequestMsg:
+			if msg.WantReply {
+				if err := s.writePacket([]byte{msgRequestFailure}); err != nil {
+					return nil, err
+				}
+			}
+
+		case UnexpectedMessageError:
+			return nil, msg
+		case *disconnectMsg:
+			return nil, os.EOF
+		default:
+			// Unknown message. Ignore.
+		}
+	}
+
+	panic("unreachable")
 }
 
 // Construct a new Conn in client mode.

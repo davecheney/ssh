@@ -6,8 +6,8 @@ package ssh
 
 import (
 	"fmt"
+	"io"
 	"os"
-	"sync"
 )
 
 // A Channel is an ordered, reliable, duplex stream that is multiplexed over an
@@ -20,10 +20,9 @@ type Channel interface {
 	// peer is likely to signal a protocol error and drop the connection.
 	Reject(reason RejectionReason, message string) os.Error
 
-	// Read may return a ChannelRequest as an os.Error.
-	Read(data []byte) (int, os.Error)
-	Write(data []byte) (int, os.Error)
-	Close() os.Error
+	io.Reader
+	io.Writer
+	io.Closer
 
 	// AckRequest either sends an ack or nack to the channel request.
 	AckRequest(ok bool) os.Error
@@ -69,59 +68,37 @@ type channel struct {
 	weClosed    bool
 	dead        bool
 
-	serverConn            *ServerConnection
+	*transport
 	myId, theirId         uint32
 	myWindow, theirWindow uint32
 	maxPacketSize         uint32
-	err                   os.Error
 
 	pendingRequests []ChannelRequest
 	pendingData     []byte
 	head, length    int
-
-	// This lock is inferior to serverConn.lock
-	lock sync.Mutex
-	cond *sync.Cond
 }
 
 func (c *channel) Accept() os.Error {
-	c.serverConn.lock.Lock()
-	defer c.serverConn.lock.Unlock()
-
-	if c.serverConn.err != nil {
-		return c.serverConn.err
-	}
-
 	confirm := channelOpenConfirmMsg{
 		PeersId:       c.theirId,
 		MyId:          c.myId,
 		MyWindow:      c.myWindow,
 		MaxPacketSize: c.maxPacketSize,
 	}
-	return c.serverConn.writePacket(marshal(msgChannelOpenConfirm, confirm))
+	return c.writePacket(marshal(msgChannelOpenConfirm, confirm))
 }
 
 func (c *channel) Reject(reason RejectionReason, message string) os.Error {
-	c.serverConn.lock.Lock()
-	defer c.serverConn.lock.Unlock()
-
-	if c.serverConn.err != nil {
-		return c.serverConn.err
-	}
-
 	reject := channelOpenFailureMsg{
 		PeersId:  c.theirId,
 		Reason:   uint32(reason),
 		Message:  message,
 		Language: "en",
 	}
-	return c.serverConn.writePacket(marshal(msgChannelOpenFailure, reject))
+	return c.writePacket(marshal(msgChannelOpenFailure, reject))
 }
 
 func (c *channel) handlePacket(packet interface{}) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
 	switch packet := packet.(type) {
 	case *channelRequestMsg:
 		req := ChannelRequest{
@@ -129,24 +106,17 @@ func (c *channel) handlePacket(packet interface{}) {
 			WantReply: packet.WantReply,
 			Payload:   packet.RequestSpecificData,
 		}
-
 		c.pendingRequests = append(c.pendingRequests, req)
-		c.cond.Signal()
 	case *channelCloseMsg:
 		c.theyClosed = true
-		c.cond.Signal()
 	case *channelEOFMsg:
 		c.theySentEOF = true
-		c.cond.Signal()
 	default:
 		panic(fmt.Sprintf("Unknown message: %#v", packet))
 	}
 }
 
 func (c *channel) handleData(data []byte) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
 	// The other side should never send us more than our window.
 	if len(data)+c.length > len(c.pendingData) {
 		// TODO(agl): we should tear down the channel with a protocol
@@ -164,14 +134,9 @@ func (c *channel) handleData(data []byte) {
 		data = data[n:]
 		c.length += n
 	}
-
-	c.cond.Signal()
 }
 
 func (c *channel) Read(data []byte) (n int, err os.Error) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
 	if c.err != nil {
 		return 0, c.err
 	}
@@ -181,7 +146,7 @@ func (c *channel) Read(data []byte) (n int, err os.Error) {
 			PeersId:         c.theirId,
 			AdditionalBytes: uint32(len(c.pendingData)) - c.myWindow,
 		})
-		if err := c.serverConn.writePacket(packet); err != nil {
+		if err := c.writePacket(packet); err != nil {
 			return 0, err
 		}
 	}
@@ -217,8 +182,6 @@ func (c *channel) Read(data []byte) (n int, err os.Error) {
 			}
 			return
 		}
-
-		c.cond.Wait()
 	}
 
 	panic("unreachable")
@@ -226,16 +189,13 @@ func (c *channel) Read(data []byte) (n int, err os.Error) {
 
 func (c *channel) Write(data []byte) (n int, err os.Error) {
 	for len(data) > 0 {
-		c.lock.Lock()
 		if c.dead || c.weClosed {
 			return 0, os.EOF
 		}
 
 		if c.theirWindow == 0 {
-			c.cond.Wait()
 			continue
 		}
-		c.lock.Unlock()
 
 		todo := data
 		if uint32(len(todo)) > c.theirWindow {
@@ -254,12 +214,9 @@ func (c *channel) Write(data []byte) (n int, err os.Error) {
 		packet[8] = byte(len(todo))
 		copy(packet[9:], todo)
 
-		c.serverConn.lock.Lock()
-		if err = c.serverConn.writePacket(packet); err != nil {
-			c.serverConn.lock.Unlock()
+		if err = c.writePacket(packet); err != nil {
 			return
 		}
-		c.serverConn.lock.Unlock()
 
 		n += len(todo)
 		data = data[len(todo):]
@@ -269,13 +226,6 @@ func (c *channel) Write(data []byte) (n int, err os.Error) {
 }
 
 func (c *channel) Close() os.Error {
-	c.serverConn.lock.Lock()
-	defer c.serverConn.lock.Unlock()
-
-	if c.serverConn.err != nil {
-		return c.serverConn.err
-	}
-
 	if c.weClosed {
 		return os.NewError("ssh: channel already closed")
 	}
@@ -284,27 +234,20 @@ func (c *channel) Close() os.Error {
 	closeMsg := channelCloseMsg{
 		PeersId: c.theirId,
 	}
-	return c.serverConn.writePacket(marshal(msgChannelClose, closeMsg))
+	return c.writePacket(marshal(msgChannelClose, closeMsg))
 }
 
 func (c *channel) AckRequest(ok bool) os.Error {
-	c.serverConn.lock.Lock()
-	defer c.serverConn.lock.Unlock()
-
-	if c.serverConn.err != nil {
-		return c.serverConn.err
-	}
-
 	if ok {
 		ack := channelRequestSuccessMsg{
 			PeersId: c.theirId,
 		}
-		return c.serverConn.writePacket(marshal(msgChannelSuccess, ack))
+		return c.writePacket(marshal(msgChannelSuccess, ack))
 	} else {
 		ack := channelRequestFailureMsg{
 			PeersId: c.theirId,
 		}
-		return c.serverConn.writePacket(marshal(msgChannelFailure, ack))
+		return c.writePacket(marshal(msgChannelFailure, ack))
 	}
 	panic("unreachable")
 }
