@@ -5,9 +5,9 @@
 package ssh
 
 import (
-	"fmt"
 	"io"
 	"os"
+	"sync"
 )
 
 // A Channel is an ordered, reliable, duplex stream that is multiplexed over an
@@ -70,13 +70,25 @@ type channel struct {
 	myId, theirId         uint32
 	myWindow, theirWindow uint32
 	maxPacketSize         uint32
+	err                   os.Error
 
 	pendingRequests []ChannelRequest
 	pendingData     []byte
 	head, length    int
+
+	// This lock is inferior to serverConn.lock
+	lock sync.Mutex
+	cond *sync.Cond
 }
 
 func (c *channel) Accept() os.Error {
+	//c.serverConn.lock.Lock()
+	//defer c.serverConn.lock.Unlock()
+
+	//if c.serverConn.err != nil {
+	//	return c.serverConn.err
+	//}
+
 	confirm := channelOpenConfirmMsg{
 		PeersId:       c.theirId,
 		MyId:          c.myId,
@@ -87,6 +99,13 @@ func (c *channel) Accept() os.Error {
 }
 
 func (c *channel) Reject(reason RejectionReason, message string) os.Error {
+	//c.serverConn.lock.Lock()
+	//defer c.serverConn.lock.Unlock()
+
+	//if c.serverConn.err != nil {
+	//	return c.serverConn.err
+	//}
+
 	reject := channelOpenFailureMsg{
 		PeersId:  c.theirId,
 		Reason:   uint32(reason),
@@ -97,6 +116,9 @@ func (c *channel) Reject(reason RejectionReason, message string) os.Error {
 }
 
 func (c *channel) handlePacket(packet interface{}) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
 	switch packet := packet.(type) {
 	case *channelRequestMsg:
 		req := ChannelRequest{
@@ -104,17 +126,24 @@ func (c *channel) handlePacket(packet interface{}) {
 			WantReply: packet.WantReply,
 			Payload:   packet.RequestSpecificData,
 		}
+
 		c.pendingRequests = append(c.pendingRequests, req)
+		c.cond.Signal()
 	case *channelCloseMsg:
 		c.theyClosed = true
+		c.cond.Signal()
 	case *channelEOFMsg:
 		c.theySentEOF = true
+		c.cond.Signal()
 	default:
-		panic(fmt.Sprintf("Unknown message: %#v", packet))
+		panic("unknown packet type")
 	}
 }
 
 func (c *channel) handleData(data []byte) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
 	// The other side should never send us more than our window.
 	if len(data)+c.length > len(c.pendingData) {
 		// TODO(agl): we should tear down the channel with a protocol
@@ -132,9 +161,18 @@ func (c *channel) handleData(data []byte) {
 		data = data[n:]
 		c.length += n
 	}
+
+	c.cond.Signal()
 }
 
 func (c *channel) Read(data []byte) (n int, err os.Error) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if c.err != nil {
+		return 0, c.err
+	}
+
 	if c.myWindow <= uint32(len(c.pendingData))/2 {
 		packet := marshal(msgChannelWindowAdjust, windowAdjustMsg{
 			PeersId:         c.theirId,
@@ -176,6 +214,8 @@ func (c *channel) Read(data []byte) (n int, err os.Error) {
 			}
 			return
 		}
+
+		c.cond.Wait()
 	}
 
 	panic("unreachable")
@@ -183,13 +223,16 @@ func (c *channel) Read(data []byte) (n int, err os.Error) {
 
 func (c *channel) Write(data []byte) (n int, err os.Error) {
 	for len(data) > 0 {
+		c.lock.Lock()
 		if c.dead || c.weClosed {
 			return 0, os.EOF
 		}
 
 		if c.theirWindow == 0 {
+			c.cond.Wait()
 			continue
 		}
+		c.lock.Unlock()
 
 		todo := data
 		if uint32(len(todo)) > c.theirWindow {
@@ -208,9 +251,12 @@ func (c *channel) Write(data []byte) (n int, err os.Error) {
 		packet[8] = byte(len(todo))
 		copy(packet[9:], todo)
 
+		//c.serverConn.lock.Lock()
 		if err = c.writePacket(packet); err != nil {
+			//	c.serverConn.lock.Unlock()
 			return
 		}
+		//c.serverConn.lock.Unlock()
 
 		n += len(todo)
 		data = data[len(todo):]
@@ -220,6 +266,13 @@ func (c *channel) Write(data []byte) (n int, err os.Error) {
 }
 
 func (c *channel) Close() os.Error {
+	//c.serverConn.lock.Lock()
+	//defer c.serverConn.lock.Unlock()
+
+	//if c.serverConn.err != nil {
+	//	return c.serverConn.err
+	//}
+
 	if c.weClosed {
 		return os.NewError("ssh: channel already closed")
 	}
@@ -232,6 +285,13 @@ func (c *channel) Close() os.Error {
 }
 
 func (c *channel) AckRequest(ok bool) os.Error {
+	//c.serverConn.lock.Lock()
+	//defer c.serverConn.lock.Unlock()
+
+	//if c.serverConn.err != nil {
+	//	return c.serverConn.err
+	//}
+
 	if ok {
 		ack := channelRequestSuccessMsg{
 			PeersId: c.theirId,

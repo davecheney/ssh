@@ -55,10 +55,9 @@ type common struct {
 	mac    hash.Hash
 	cipher cipher.Stream
 
-        cipherAlgo      string
-        macAlgo         string
-        compressionAlgo string
-
+	cipherAlgo      string
+	macAlgo         string
+	compressionAlgo string
 }
 
 // Read and decrypt a single packet from the remote peer.
