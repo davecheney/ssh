@@ -36,7 +36,10 @@ func TestClientConnect(t *testing.T) {
 	if err := ch.Ptyreq("vt100", 80, 24); err != nil {
 		log.Fatal(err)
 	}
-	if err := ch.Exec("/usr/bin/whoami"); err != nil {
+	if err := ch.Exec("/bin/cat"); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := ch.Write([]byte("Hello world!")); err != nil {
 		log.Fatal(err)
 	}
 	buf := make([]byte, 1024)
@@ -44,5 +47,5 @@ func TestClientConnect(t *testing.T) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Println(buf[:read])
+	log.Println(string(buf[:read]))
 }

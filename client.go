@@ -34,7 +34,7 @@ func newClientConn(c net.Conn, config *ClientConfig) *ClientConn {
 		config:    config,
 		chanlist: chanlist{
 			Mutex: new(sync.Mutex),
-			chans: make(map[uint32]*ClientChan),
+			chans: make(map[uint32]chan interface{}),
 		},
 	}
 	return conn
@@ -225,14 +225,13 @@ func (c *ClientConn) kexDH(group *dhGroup, hashFunc crypto.Hash, magics *handsha
 	return H, K, nil
 }
 
-// Open a new client side channel. Valid types are listed in
-// RFC 4250 4.9.1.
+// Open a new client side channel. Valid types are listed in RFC 4250 4.9.1.
 func (c *ClientConn) OpenChan(typ string) (*ClientChan, os.Error) {
 	ch := c.newChan(c.transport)
 	if err := c.writePacket(marshal(msgChannelOpen, channelOpenMsg{
 		ChanType:      typ,
 		PeersId:       ch.id,
-		PeersWindow:   8192,
+		PeersWindow:   ch.myWindow,
 		MaxPacketSize: 16384,
 	})); err != nil {
 		// remove channel reference
@@ -251,6 +250,7 @@ func (c *ClientConn) OpenChan(typ string) (*ClientChan, os.Error) {
 	return ch, nil
 }
 
+// Drain incoming messages and route channel messages 
 func (c *ClientConn) mainloop() {
 	// make readPacket() non blocking
 	read := make(chan interface{}, 16)
@@ -271,27 +271,27 @@ func (c *ClientConn) mainloop() {
 			// operation is a []byte, a raw message
 			switch msg := decode(in).(type) {
 			case *channelOpenMsg:
-				c.getChan(msg.PeersId).msg <- msg
+				c.getChan(msg.PeersId) <- msg
 			case *channelOpenConfirmMsg:
-				c.getChan(msg.PeersId).msg <- msg
+				c.getChan(msg.PeersId) <- msg
 			case *channelOpenFailureMsg:
-				c.getChan(msg.PeersId).msg <- msg
+				c.getChan(msg.PeersId) <- msg
 			case *channelCloseMsg:
 				c.chanlist.remove(msg.PeersId)
 			case *channelEOFMsg:
-				c.getChan(msg.PeersId).msg <- msg
+				c.getChan(msg.PeersId) <- msg
 			case *channelRequestSuccessMsg:
-				c.getChan(msg.PeersId).msg <- msg
+				c.getChan(msg.PeersId) <- msg
 			case *channelRequestFailureMsg:
-				c.getChan(msg.PeersId).msg <- msg
+				c.getChan(msg.PeersId) <- msg
 			case *channelRequestMsg:
-				c.getChan(msg.PeersId).msg <- msg
+				c.getChan(msg.PeersId) <- msg
 			case *channelData:
-				c.getChan(msg.PeersId).msg <- msg
+				c.getChan(msg.PeersId) <- msg
 			case *windowAdjustMsg:
-				c.getChan(msg.PeersId).msg <- msg
+				c.getChan(msg.PeersId) <- msg
 			default:
-				println("mainloop: unhandled packet type", in[0])
+				fmt.Printf("mainloop: unhandled %#v\n", msg)
 			}
 		case os.Error:
 			// on any error close the connection
@@ -333,6 +333,7 @@ type ClientConfig struct {
 	SupportedKexAlgos, SupportedHostKeyAlgos, SupportedCiphers, SupportedMACs, SupportedCompressions []string
 }
 
+// Represents a single SSH channel that is multiplexed over an SSH connection.
 type ClientChan struct {
 	*transport
 	id, peerId uint32
@@ -372,19 +373,29 @@ func (c *ClientChan) Setenv(name, value string) os.Error {
 	marshalString(payload[:namLen], []byte(name))
 	marshalString(payload[namLen:], []byte(value))
 
-	if err := c.sendMessage(msgChannelRequest, channelRequestMsg{
+	return c.sendChanReq(channelRequestMsg{
 		PeersId:             c.peerId,
 		Request:             "env",
 		WantReply:           true,
 		RequestSpecificData: payload,
-	}); err != nil {
+	})
+}
+
+func (c *ClientChan) sendChanReq(req channelRequestMsg) os.Error {
+	if err := c.writePacket(marshal(msgChannelRequest, req)); err != nil {
 		return err
 	}
-	switch msg := (<-c.msg).(type) {
-	case *channelRequestSuccessMsg:
-		return nil
-	case *channelRequestFailureMsg:
-		return os.NewError("unable to set env var \"" + name + "\"")
+	for {
+		switch msg := (<-c.msg).(type) {
+		case *channelRequestSuccessMsg:
+			return nil
+		case *channelRequestFailureMsg:
+			return os.NewError(req.Request)
+		case *windowAdjustMsg:
+			c.theirWindow += msg.AdditionalBytes
+		default:
+			return fmt.Errorf("%#v", msg)
+		}
 	}
 	panic("unreachable")
 }
@@ -400,53 +411,39 @@ func (c *ClientChan) Ptyreq(term string, h, w int) os.Error {
 	binary.Write(b, binary.BigEndian, uint32(w*8))
 	b.Write([]byte{0, 0, 0, 1, 0, 0, 0, 0, 0}) // empty mode list
 
-	if err := c.sendMessage(msgChannelRequest, channelRequestMsg{
+	return c.sendChanReq(channelRequestMsg{
 		PeersId:             c.peerId,
 		Request:             "pty-req",
 		WantReply:           true,
 		RequestSpecificData: b.Bytes(),
-	}); err != nil {
-		return err
-	}
-	switch msg := (<-c.msg).(type) {
-	case *channelRequestSuccessMsg:
-		return nil
-	case *channelRequestFailureMsg:
-		return os.NewError("unable to request a pty")
-	}
-	panic("unreachable")
+	})
 }
 
 func (c *ClientChan) Exec(command string) os.Error {
 	cmdLen := stringLength([]byte(command))
 	payload := make([]byte, cmdLen)
 	marshalString(payload, []byte(command))
-	if err := c.sendMessage(msgChannelRequest, channelRequestMsg{
+	return c.sendChanReq(channelRequestMsg{
 		PeersId:             c.peerId,
 		Request:             "exec",
 		WantReply:           true,
 		RequestSpecificData: payload,
-	}); err != nil {
-		return err
-	}
-	for {
-		switch msg := (<-c.msg).(type) {
-		case *channelRequestSuccessMsg:
-			return nil
-		case *channelRequestFailureMsg:
-			return os.NewError("unable to execure \"" + command + "\"")
-		default:
-			fmt.Printf("%#v\n", msg)
-		}
-	}
-	panic("unreachable")
+	})
+}
+
+func (c *ClientChan) Shell() os.Error {
+	return c.sendChanReq(channelRequestMsg{
+		PeersId:   c.peerId,
+		Request:   "shell",
+		WantReply: true,
+	})
 }
 
 func (c *ClientChan) Read(data []byte) (n int, err os.Error) {
-	if c.myWindow <= uint32(len(c.pendingData))/2 {
+	if c.myWindow <= uint32(len(data))/2 {
 		packet := marshal(msgChannelWindowAdjust, windowAdjustMsg{
 			PeersId:         c.theirId,
-			AdditionalBytes: uint32(len(c.pendingData)) - c.myWindow,
+			AdditionalBytes: uint32(len(data)) - c.myWindow,
 		})
 		if err := c.writePacket(packet); err != nil {
 			return 0, err
@@ -460,7 +457,7 @@ func (c *ClientChan) Read(data []byte) (n int, err os.Error) {
 
 		switch msg := (<-c.msg).(type) {
 		case *channelData:
-			copy(data, msg.Payload)
+			n = copy(data, msg.Payload)
 			return
 		default:
 			fmt.Printf("%#v\n", msg)
@@ -472,11 +469,16 @@ func (c *ClientChan) Read(data []byte) (n int, err os.Error) {
 
 func (c *ClientChan) Write(data []byte) (n int, err os.Error) {
 	for len(data) > 0 {
+		// no space left in the window ? wait for more
 		if c.theirWindow == 0 {
-			c.cond.Wait()
+			switch msg := (<-c.msg).(type) {
+			case *windowAdjustMsg:
+				c.theirWindow += msg.AdditionalBytes
+			default:
+				fmt.Printf("%#v\n", msg)
+			}
 			continue
 		}
-		c.lock.Unlock()
 
 		todo := data
 		if uint32(len(todo)) > c.theirWindow {
@@ -501,13 +503,12 @@ func (c *ClientChan) Write(data []byte) (n int, err os.Error) {
 		n += len(todo)
 		data = data[len(todo):]
 	}
-
 	return
 }
 
 type chanlist struct {
 	*sync.Mutex
-	chans map[uint32]*ClientChan
+	chans map[uint32]chan interface{}
 }
 
 func (c *chanlist) newChan(t *transport) *ClientChan {
@@ -520,16 +521,17 @@ func (c *chanlist) newChan(t *transport) *ClientChan {
 				transport: t,
 				id:        uint32(i),
 				msg:       make(chan interface{}, 16),
+				myWindow:  8192,
 			}
 			ch.cond = sync.NewCond(&ch.lock)
-			c.chans[i] = ch
+			c.chans[i] = ch.msg
 			return ch
 		}
 	}
 	panic("unable to find free channel")
 }
 
-func (c *chanlist) getChan(id uint32) *ClientChan {
+func (c *chanlist) getChan(id uint32) chan interface{} {
 	c.Lock()
 	defer c.Unlock()
 	return c.chans[id]
