@@ -127,13 +127,3 @@ func findAgreedAlgorithms(transport *transport, clientKexInit, serverKexInit *ke
 	ok = true
 	return
 }
-
-// returns a func that will return a monotonically
-// increasing uint32.
-func nextIdFunc() func() uint32 {
-	var count uint32
-	return func() (ret uint32) {
-		ret, count = count, count+1
-		return
-	}
-}

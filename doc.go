@@ -3,7 +3,7 @@
 // license that can be found in the LICENSE file.
 
 /*
-Package ssh implements an SSH server.
+Package ssh implements an SSH client and server.
 
 SSH is a transport security protocol, an authentication protocol and a
 family of application protocols. The most typical application level
@@ -75,5 +75,19 @@ present a simple terminal interface.
 		}
 		return
 	}()
+
+An SSH client is represented with a ClientConn. Currently only the "password"
+authentication method is supported. 
+
+	config := &ClientConfig{
+		User: "username",
+		Password: "123456",
+	}
+	client, err := Dial("yourserver.com:22", config)
+
+Each ClientConn can support multiple channels, represented by ClientChan. Each
+channel should be of a type specified in rfc4250, 4.9.1.
+
+	ch, err := client.OpenChan("session")
 */
 package ssh
