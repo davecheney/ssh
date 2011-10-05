@@ -35,3 +35,8 @@ func TestReadVersionWithoutCRLF(t *testing.T) {
 		t.Error("readVersion did not notice \\n was missing")
 	}
 }
+
+func TestTrasportRead(t *testing.T) {
+	r := newTransport(nil)
+	r.Read(nil)
+}

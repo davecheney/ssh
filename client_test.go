@@ -24,6 +24,7 @@ func TestClientConnect(t *testing.T) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	log.Printf("%#v", config)
 	defer conn.Close()
 	ch, err := conn.OpenChan("session")
 	if err != nil {
@@ -43,7 +44,7 @@ func TestClientConnect(t *testing.T) {
 		log.Fatal(err)
 	}
 	buf := make([]byte, 1024)
-	read, err := ch.Read(buf)
+	read, err := ch.Read(nil)
 	if err != nil {
 		log.Fatal(err)
 	}

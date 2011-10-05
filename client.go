@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"net"
 	"sync"
@@ -34,7 +35,7 @@ func newClientConn(c net.Conn, config *ClientConfig) *ClientConn {
 		config:    config,
 		chanlist: chanlist{
 			Mutex: new(sync.Mutex),
-			chans: make(map[uint32]chan interface{}),
+			chans: make(map[uint32]*ClientChan),
 		},
 	}
 	return conn
@@ -231,7 +232,7 @@ func (c *ClientConn) OpenChan(typ string) (*ClientChan, os.Error) {
 	if err := c.writePacket(marshal(msgChannelOpen, channelOpenMsg{
 		ChanType:      typ,
 		PeersId:       ch.id,
-		PeersWindow:   ch.myWindow,
+		PeersWindow:   0,
 		MaxPacketSize: 16384,
 	})); err != nil {
 		// remove channel reference
@@ -250,7 +251,8 @@ func (c *ClientConn) OpenChan(typ string) (*ClientChan, os.Error) {
 	return ch, nil
 }
 
-// Drain incoming messages and route channel messages 
+// Drain incoming messages and route channel messages to their
+// respective ClientChans.
 func (c *ClientConn) mainloop() {
 	// make readPacket() non blocking
 	read := make(chan interface{}, 16)
@@ -268,28 +270,30 @@ func (c *ClientConn) mainloop() {
 	for {
 		switch in := (<-read).(type) {
 		case []byte:
-			// operation is a []byte, a raw message
+			// incoming packet, decode and dispatch
 			switch msg := decode(in).(type) {
 			case *channelOpenMsg:
-				c.getChan(msg.PeersId) <- msg
+				c.getChan(msg.PeersId).msg <- msg
 			case *channelOpenConfirmMsg:
-				c.getChan(msg.PeersId) <- msg
+				c.getChan(msg.PeersId).msg <- msg
 			case *channelOpenFailureMsg:
-				c.getChan(msg.PeersId) <- msg
+				c.getChan(msg.PeersId).msg <- msg
 			case *channelCloseMsg:
 				c.chanlist.remove(msg.PeersId)
 			case *channelEOFMsg:
-				c.getChan(msg.PeersId) <- msg
+				c.getChan(msg.PeersId).msg <- msg
 			case *channelRequestSuccessMsg:
-				c.getChan(msg.PeersId) <- msg
+				c.getChan(msg.PeersId).msg <- msg
 			case *channelRequestFailureMsg:
-				c.getChan(msg.PeersId) <- msg
+				c.getChan(msg.PeersId).msg <- msg
 			case *channelRequestMsg:
-				c.getChan(msg.PeersId) <- msg
-			case *channelData:
-				c.getChan(msg.PeersId) <- msg
+				c.getChan(msg.PeersId).msg <- msg
 			case *windowAdjustMsg:
-				c.getChan(msg.PeersId) <- msg
+				c.getChan(msg.PeersId).stdinWriter.win <- msg.AdditionalBytes
+			case *channelData:
+				c.getChan(msg.PeersId).stdoutReader.data <- msg.Payload
+			case *channelExtendedData:
+				c.getChan(msg.PeersId).stderrReader.dataExt <- msg.Data
 			default:
 				fmt.Printf("mainloop: unhandled %#v\n", msg)
 			}
@@ -335,24 +339,34 @@ type ClientConfig struct {
 
 // Represents a single SSH channel that is multiplexed over an SSH connection.
 type ClientChan struct {
-	*transport
+	packetWriter
+	*stdinWriter
+	*stdoutReader
+	*stderrReader
 	id, peerId uint32
-	msg        chan interface{} // incoming messages (including data)
+	msg        chan interface{} // incoming messages 
+	data       chan []byte      // data from msgChannelData
+	dataExt    chan string      // data from msgChannelExtendedData
 
-	theyClosed  bool
-	theySentEOF bool
-	weClosed    bool
-	dead        bool
+}
 
-	myId, theirId         uint32
-	myWindow, theirWindow uint32
-	maxPacketSize         uint32
-	pendingData           []byte
+func newClientChan(t *transport, id uint32) *ClientChan {
+	return &ClientChan{
+		packetWriter: t,
+		stdinWriter: &stdinWriter{
+			packetWriter: t,
+		},
+		stdoutReader: &stdoutReader{
+			packetWriter: t,
+			data: make(chan []byte, 16),
+		},
+		stderrReader: &stderrReader{
+			dataExt: make(chan string, 16),
+		},
 
-	head, length int
-
-	lock sync.Mutex
-	cond *sync.Cond
+		id:       id,
+		msg:      make(chan interface{}, 16),
+	}
 }
 
 func (c *ClientChan) Close() os.Error {
@@ -391,8 +405,6 @@ func (c *ClientChan) sendChanReq(req channelRequestMsg) os.Error {
 			return nil
 		case *channelRequestFailureMsg:
 			return os.NewError(req.Request)
-		case *windowAdjustMsg:
-			c.theirWindow += msg.AdditionalBytes
 		default:
 			return fmt.Errorf("%#v", msg)
 		}
@@ -431,84 +443,19 @@ func (c *ClientChan) Exec(command string) os.Error {
 	})
 }
 
-func (c *ClientChan) Shell() os.Error {
-	return c.sendChanReq(channelRequestMsg{
+func (c *ClientChan) Shell() (io.WriteCloser, io.ReadCloser, io.Reader, os.Error) {
+	err := c.sendChanReq(channelRequestMsg{
 		PeersId:   c.peerId,
 		Request:   "shell",
 		WantReply: true,
 	})
-}
 
-func (c *ClientChan) Read(data []byte) (n int, err os.Error) {
-	if c.myWindow <= uint32(len(data))/2 {
-		packet := marshal(msgChannelWindowAdjust, windowAdjustMsg{
-			PeersId:         c.theirId,
-			AdditionalBytes: uint32(len(data)) - c.myWindow,
-		})
-		if err := c.writePacket(packet); err != nil {
-			return 0, err
-		}
-	}
-
-	for {
-		if c.theySentEOF || c.theyClosed || c.dead {
-			return 0, os.EOF
-		}
-
-		switch msg := (<-c.msg).(type) {
-		case *channelData:
-			n = copy(data, msg.Payload)
-			return
-		default:
-			fmt.Printf("%#v\n", msg)
-		}
-	}
-
-	panic("unreachable")
-}
-
-func (c *ClientChan) Write(data []byte) (n int, err os.Error) {
-	for len(data) > 0 {
-		// no space left in the window ? wait for more
-		if c.theirWindow == 0 {
-			switch msg := (<-c.msg).(type) {
-			case *windowAdjustMsg:
-				c.theirWindow += msg.AdditionalBytes
-			default:
-				fmt.Printf("%#v\n", msg)
-			}
-			continue
-		}
-
-		todo := data
-		if uint32(len(todo)) > c.theirWindow {
-			todo = todo[:c.theirWindow]
-		}
-
-		packet := make([]byte, 1+4+4+len(todo))
-		packet[0] = msgChannelData
-		packet[1] = byte(c.theirId) >> 24
-		packet[2] = byte(c.theirId) >> 16
-		packet[3] = byte(c.theirId) >> 8
-		packet[4] = byte(c.theirId)
-		packet[5] = byte(len(todo)) >> 24
-		packet[6] = byte(len(todo)) >> 16
-		packet[7] = byte(len(todo)) >> 8
-		packet[8] = byte(len(todo))
-		copy(packet[9:], todo)
-
-		if err = c.writePacket(packet); err != nil {
-			return
-		}
-		n += len(todo)
-		data = data[len(todo):]
-	}
-	return
+	return c.stdinWriter, c.stdoutReader, c.stderrReader, err
 }
 
 type chanlist struct {
 	*sync.Mutex
-	chans map[uint32]chan interface{}
+	chans map[uint32]*ClientChan
 }
 
 func (c *chanlist) newChan(t *transport) *ClientChan {
@@ -517,21 +464,15 @@ func (c *chanlist) newChan(t *transport) *ClientChan {
 
 	for i := uint32(0); i < 2^31; i++ {
 		if _, ok := c.chans[i]; !ok {
-			ch := &ClientChan{
-				transport: t,
-				id:        uint32(i),
-				msg:       make(chan interface{}, 16),
-				myWindow:  8192,
-			}
-			ch.cond = sync.NewCond(&ch.lock)
-			c.chans[i] = ch.msg
+			ch := newClientChan(t, i)
+			c.chans[i] = ch
 			return ch
 		}
 	}
 	panic("unable to find free channel")
 }
 
-func (c *chanlist) getChan(id uint32) chan interface{} {
+func (c *chanlist) getChan(id uint32) *ClientChan {
 	c.Lock()
 	defer c.Unlock()
 	return c.chans[id]
@@ -541,4 +482,91 @@ func (c *chanlist) remove(id uint32) {
 	c.Lock()
 	defer c.Unlock()
 	c.chans[id] = nil, false
+}
+
+type stdinWriter struct {
+	win          chan uint32 // recieves window adjustments
+	id           uint32
+	rwin         uint32 // current rwin size
+	packetWriter        // for sending channeDataMsg
+}
+
+func (w *stdinWriter) Write(data []byte) (n int, err os.Error) {
+	for {
+		if w.rwin == 0 {
+			w.rwin += <-w.win
+			continue
+		}
+		packet := make([]byte, 1+4+4+len(data))
+		packet[0] = msgChannelData
+		packet[1] = byte(w.id) >> 24
+		packet[2] = byte(w.id) >> 16
+		packet[3] = byte(w.id) >> 8
+		packet[4] = byte(w.id)
+		packet[5] = byte(len(data)) >> 24
+		packet[6] = byte(len(data)) >> 16
+		packet[7] = byte(len(data)) >> 8
+		packet[8] = byte(len(data))
+		copy(packet[9:], data)
+
+		if err = w.writePacket(packet); err != nil {
+			return
+		}
+
+		err = w.writePacket(packet)
+		w.rwin -= uint32(n)
+		return
+	}
+	panic("unreachable")
+}
+
+func (w *stdinWriter) Close() os.Error {
+	return w.writePacket(marshal(msgChannelEOF, &channelEOFMsg{w.id}))
+}
+
+type stdoutReader struct {
+	data         chan []byte // receives data from remote
+	id           uint32
+	win          int // current win size
+	packetWriter     // for sending windowAdjustMsg
+	buf          []byte
+}
+
+func (r *stdoutReader) Read(data []byte) (int, os.Error) {
+	for {
+		if len(r.buf) > 0 {
+			n := copy(data, r.buf)
+			r.buf = r.buf[n:]
+			r.win += n
+			err := r.writePacket(marshal(msgChannelWindowAdjust, &windowAdjustMsg{
+				PeersId:         r.id,
+				AdditionalBytes: uint32(n),
+			}))
+			return n, err
+		}
+		r.buf = []byte(<-r.data)
+		r.win -= len(r.buf)
+	}
+	panic("unreachable")
+}
+
+func (r *stdoutReader) Close() os.Error {
+	return r.writePacket(marshal(msgChannelEOF, &channelEOFMsg{r.id}))
+}
+
+type stderrReader struct {
+	dataExt chan string // receives dataExt from remote
+	buf     []byte      // buffer current dataExt
+}
+
+func (r *stderrReader) Read(data []byte) (int, os.Error) {
+	for {
+		if len(r.buf) > 0 {
+			n := copy(data, r.buf)
+			r.buf = r.buf[n:]
+			return n, nil
+		}
+		r.buf = []byte(<-r.dataExt)
+	}
+	panic("unreachable")
 }

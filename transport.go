@@ -23,14 +23,32 @@ const (
 	paddingMultiple = 16 // TODO(dfc) does this need to be configurable?
 )
 
+// filteredConn reduces the set of methods exposed when embeddeding
+// a net.Conn inside ssh.transport.
+// TODO(dfc) suggestions for a better name will be warmly received.
+type filteredConn interface {
+	// Close closes the connection.
+	Close() os.Error
+
+	// LocalAddr returns the local network address.
+	LocalAddr() net.Addr
+
+	// RemoteAddr returns the remote network address.
+	RemoteAddr() net.Addr
+}
+
+// Types implementing packetWriter provide the ability to send packets to
+// an SSH peer.
+type packetWriter interface {
+	writePacket(packet []byte) os.Error
+}
+
 // transport represents the SSH connection to the remote peer.
 type transport struct {
 	reader
 	writer
 
-	io.Closer
-
-	RemoteAddr func() net.Addr
+	filteredConn
 }
 
 // reader represents the incoming connection state.
@@ -215,10 +233,7 @@ func newTransport(conn net.Conn) *transport {
 			rand:   rand.Reader,
 			Mutex:  new(sync.Mutex),
 		},
-		Closer: conn,
-		RemoteAddr: func() net.Addr {
-			return conn.RemoteAddr()
-		},
+		filteredConn: conn,
 	}
 }
 
