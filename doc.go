@@ -77,11 +77,17 @@ present a simple terminal interface.
 	}()
 
 An SSH client is represented with a ClientConn. Currently only the "password"
-authentication method is supported. 
+authentication method is supported. Currently only a limited set of ciphers, MACs
+and compressions schemes are supported.
 
 	config := &ClientConfig{
 		User: "username",
 		Password: "123456",
+                SupportedKexAlgos:     []string{"diffie-hellman-group14-sha1"},
+                SupportedHostKeyAlgos: []string{"ssh-rsa"},
+                SupportedCiphers:      []string{"aes128-ctr"},
+                SupportedMACs:         []string{"hmac-sha1-96"},
+                SupportedCompressions: []string{"none"},
 	}
 	client, err := Dial("yourserver.com:22", config)
 

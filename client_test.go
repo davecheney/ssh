@@ -44,7 +44,7 @@ func TestClientConnect(t *testing.T) {
 		log.Fatal(err)
 	}
 	buf := make([]byte, 1024)
-	read, err := ch.Read(nil)
+	read, err := ch.Read(buf)
 	if err != nil {
 		log.Fatal(err)
 	}

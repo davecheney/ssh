@@ -17,8 +17,7 @@ import (
 	"sync"
 )
 
-// clientVersion is the fixed identification string that the 
-// client will use.
+// clientVersion is the fixed identification string that the client will use.
 var clientVersion = []byte("SSH-2.0-Go\r\n")
 
 // ClientConn represents the client side of an SSH connection.
@@ -169,7 +168,8 @@ func (c *ClientConn) authenticate() os.Error {
 func (c *ClientConn) sendUserAuthReq(method string) os.Error {
 	length := stringLength([]byte(c.config.Password)) + 1
 	payload := make([]byte, length)
-	marshalString(payload[1:], []byte(c.config.Password)) // payload[0] = boolean:false
+	// payload[0] = boolean (false)
+	marshalString(payload[1:], []byte(c.config.Password))
 
 	return c.writePacket(marshal(msgUserAuthRequest, userAuthRequestMsg{
 		User:    c.config.User,
@@ -179,7 +179,7 @@ func (c *ClientConn) sendUserAuthReq(method string) os.Error {
 	}))
 }
 
-// kexDH performs Diffie-Hellman key agreement on a ClientConnection. The
+// kexDH performs Diffie-Hellman key agreement on a ClientConn. The
 // returned values are given the same names as in RFC 4253, section 8.
 func (c *ClientConn) kexDH(group *dhGroup, hashFunc crypto.Hash, magics *handshakeMagics, hostKeyAlgo string) ([]byte, []byte, os.Error) {
 	x, err := rand.Int(rand.Reader, group.p)
@@ -226,23 +226,23 @@ func (c *ClientConn) kexDH(group *dhGroup, hashFunc crypto.Hash, magics *handsha
 	return H, K, nil
 }
 
-// Open a new client side channel. Valid types are listed in RFC 4250 4.9.1.
+// Open a new client side channel. Valid session types are listed in RFC 4250 4.9.1.
 func (c *ClientConn) OpenChan(typ string) (*ClientChan, os.Error) {
-	ch := c.newChan(c.transport)
+	ch, id := c.newChan(c.transport)
 	if err := c.writePacket(marshal(msgChannelOpen, channelOpenMsg{
 		ChanType:      typ,
-		PeersId:       ch.id,
-		PeersWindow:   0,
+		PeersId:       id,
+		PeersWindow:   8192,
 		MaxPacketSize: 16384,
 	})); err != nil {
 		// remove channel reference
-		c.chanlist.remove(ch.id)
+		c.chanlist.remove(id)
 		return nil, err
 	}
 	// wait for response
 	switch msg := (<-ch.msg).(type) {
 	case *channelOpenConfirmMsg:
-		ch.peerId = msg.MyId
+		ch.peersId = msg.MyId
 	case *channelOpenFailureMsg:
 		return nil, os.NewError(msg.Message)
 	default:
@@ -251,8 +251,7 @@ func (c *ClientConn) OpenChan(typ string) (*ClientChan, os.Error) {
 	return ch, nil
 }
 
-// Drain incoming messages and route channel messages to their
-// respective ClientChans.
+// Drain incoming messages and route channel messages to their respective ClientChans.
 func (c *ClientConn) mainloop() {
 	// make readPacket() non blocking
 	read := make(chan interface{}, 16)
@@ -279,6 +278,10 @@ func (c *ClientConn) mainloop() {
 			case *channelOpenFailureMsg:
 				c.getChan(msg.PeersId).msg <- msg
 			case *channelCloseMsg:
+				ch := c.getChan(msg.PeersId)
+				close(ch.stdinWriter.win)
+				close(ch.stdoutReader.data)
+				close(ch.stderrReader.dataExt)
 				c.chanlist.remove(msg.PeersId)
 			case *channelEOFMsg:
 				c.getChan(msg.PeersId).msg <- msg
@@ -289,7 +292,7 @@ func (c *ClientConn) mainloop() {
 			case *channelRequestMsg:
 				c.getChan(msg.PeersId).msg <- msg
 			case *windowAdjustMsg:
-				c.getChan(msg.PeersId).stdinWriter.win <- msg.AdditionalBytes
+				c.getChan(msg.PeersId).stdinWriter.win <- int(msg.AdditionalBytes)
 			case *channelData:
 				c.getChan(msg.PeersId).stdoutReader.data <- msg.Payload
 			case *channelExtendedData:
@@ -307,9 +310,8 @@ func (c *ClientConn) mainloop() {
 	}
 }
 
-// Dial connects to the given network address using net.Dial
-// and then initiates a SSH handshake, returning the resulting
-// SSH client connection.
+// Dial connects to the given network address using net.Dial and then initiates 
+// a SSH handshake, returning the resulting SSH client connection.
 func Dial(addr string, config *ClientConfig) (*ClientConn, os.Error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -343,11 +345,8 @@ type ClientChan struct {
 	*stdinWriter
 	*stdoutReader
 	*stderrReader
-	id, peerId uint32
-	msg        chan interface{} // incoming messages 
-	data       chan []byte      // data from msgChannelData
-	dataExt    chan string      // data from msgChannelExtendedData
-
+	id, peersId uint32
+	msg         chan interface{} // incoming messages 
 }
 
 func newClientChan(t *transport, id uint32) *ClientChan {
@@ -355,31 +354,32 @@ func newClientChan(t *transport, id uint32) *ClientChan {
 		packetWriter: t,
 		stdinWriter: &stdinWriter{
 			packetWriter: t,
+			id:           id,
+			win:          make(chan int, 16),
 		},
 		stdoutReader: &stdoutReader{
 			packetWriter: t,
-			data: make(chan []byte, 16),
+			id:           id,
+			win:          8192,
+			data:         make(chan []byte, 16),
 		},
 		stderrReader: &stderrReader{
 			dataExt: make(chan string, 16),
 		},
-
-		id:       id,
-		msg:      make(chan interface{}, 16),
+		id:  id,
+		msg: make(chan interface{}, 16),
 	}
 }
 
+// Close the ClientChan. This does not close the underlying ClientConn.
 func (c *ClientChan) Close() os.Error {
-	if err := c.writePacket(marshal(msgChannelClose, channelCloseMsg{
+	return c.writePacket(marshal(msgChannelClose, channelCloseMsg{
 		PeersId: c.id,
-	})); err != nil {
-		return err
-	}
-	return nil
+	}))
 }
 
-// Pass an environment variable to a channel to be applied
-// to any shell/command started later
+// Pass an environment variable to a channel to be applied to any 
+// shell/command started later.
 func (c *ClientChan) Setenv(name, value string) os.Error {
 	namLen := stringLength([]byte(name))
 	valLen := stringLength([]byte(value))
@@ -388,7 +388,7 @@ func (c *ClientChan) Setenv(name, value string) os.Error {
 	marshalString(payload[namLen:], []byte(value))
 
 	return c.sendChanReq(channelRequestMsg{
-		PeersId:             c.peerId,
+		PeersId:             c.id,
 		Request:             "env",
 		WantReply:           true,
 		RequestSpecificData: payload,
@@ -424,41 +424,51 @@ func (c *ClientChan) Ptyreq(term string, h, w int) os.Error {
 	b.Write([]byte{0, 0, 0, 1, 0, 0, 0, 0, 0}) // empty mode list
 
 	return c.sendChanReq(channelRequestMsg{
-		PeersId:             c.peerId,
+		PeersId:             c.id,
 		Request:             "pty-req",
 		WantReply:           true,
 		RequestSpecificData: b.Bytes(),
 	})
 }
 
-func (c *ClientChan) Exec(command string) os.Error {
+// Execute command on the remote host. A tupple of a WriteCloser, a ReadCloser, and an io.Reader 
+// corresponding to the remote stdin, stdout and stderr. Closing either the remote stdin or stdout 
+// stream does not close the channel, but sends an EOF to the remote process. If an error occurs, 
+// os.Error will be non nil.
+func (c *ClientChan) Exec(command string) (io.WriteCloser, io.ReadCloser, io.Reader, os.Error) {
 	cmdLen := stringLength([]byte(command))
 	payload := make([]byte, cmdLen)
 	marshalString(payload, []byte(command))
-	return c.sendChanReq(channelRequestMsg{
-		PeersId:             c.peerId,
+	err := c.sendChanReq(channelRequestMsg{
+		PeersId:             c.id,
 		Request:             "exec",
 		WantReply:           true,
 		RequestSpecificData: payload,
 	})
-}
-
-func (c *ClientChan) Shell() (io.WriteCloser, io.ReadCloser, io.Reader, os.Error) {
-	err := c.sendChanReq(channelRequestMsg{
-		PeersId:   c.peerId,
-		Request:   "shell",
-		WantReply: true,
-	})
-
 	return c.stdinWriter, c.stdoutReader, c.stderrReader, err
 }
 
+// Execute the default shell for the remote user. A tupple of a WriteCloser, a ReadCloser, and an
+// io.Reader corresponding to the remote stdin, stdout and stderr. Closing either the remote stdin 
+// or stdout stream does not close the channel, but sends an EOF to the remote process. If an error 
+// occurs, os.Error will be non nil.
+func (c *ClientChan) Shell() (io.WriteCloser, io.ReadCloser, io.Reader, os.Error) {
+	err := c.sendChanReq(channelRequestMsg{
+		PeersId:   c.id,
+		Request:   "shell",
+		WantReply: true,
+	})
+	return c.stdinWriter, c.stdoutReader, c.stderrReader, err
+}
+
+// Thread safe channel list.
 type chanlist struct {
 	*sync.Mutex
 	chans map[uint32]*ClientChan
 }
 
-func (c *chanlist) newChan(t *transport) *ClientChan {
+// Allocate a new ClientChan with the next avail local id.
+func (c *chanlist) newChan(t *transport) (*ClientChan, uint32) {
 	c.Lock()
 	defer c.Unlock()
 
@@ -466,7 +476,7 @@ func (c *chanlist) newChan(t *transport) *ClientChan {
 		if _, ok := c.chans[i]; !ok {
 			ch := newClientChan(t, i)
 			c.chans[i] = ch
-			return ch
+			return ch, uint32(i)
 		}
 	}
 	panic("unable to find free channel")
@@ -484,46 +494,42 @@ func (c *chanlist) remove(id uint32) {
 	c.chans[id] = nil, false
 }
 
+// Represents the stdin stream to the remote peer.
 type stdinWriter struct {
-	win          chan uint32 // recieves window adjustments
+	win          chan int // receives window adjustments
 	id           uint32
-	rwin         uint32 // current rwin size
-	packetWriter        // for sending channeDataMsg
+	rwin         int // current rwin size
+	packetWriter     // for sending channeDataMsg
 }
 
+// Write data to the stdin of the remote session
 func (w *stdinWriter) Write(data []byte) (n int, err os.Error) {
 	for {
 		if w.rwin == 0 {
-			w.rwin += <-w.win
+			win, ok := <-w.win
+			if !ok {
+				return 0, os.EOF
+			}
+			w.rwin += win
 			continue
 		}
-		packet := make([]byte, 1+4+4+len(data))
-		packet[0] = msgChannelData
-		packet[1] = byte(w.id) >> 24
-		packet[2] = byte(w.id) >> 16
-		packet[3] = byte(w.id) >> 8
-		packet[4] = byte(w.id)
-		packet[5] = byte(len(data)) >> 24
-		packet[6] = byte(len(data)) >> 16
-		packet[7] = byte(len(data)) >> 8
-		packet[8] = byte(len(data))
-		copy(packet[9:], data)
-
-		if err = w.writePacket(packet); err != nil {
-			return
-		}
-
-		err = w.writePacket(packet)
-		w.rwin -= uint32(n)
+		n = len(data)
+		packet := make([]byte, 0, 9+n)
+		packet = append(packet, msgChannelData,
+			byte(w.id)>>24, byte(w.id)>>16, byte(w.id)>>8, byte(w.id),
+			byte(n)>>24, byte(n)>>16, byte(n)>>8, byte(n))
+		err = w.writePacket(append(packet, data...))
+		w.rwin -= n
 		return
 	}
 	panic("unreachable")
 }
 
 func (w *stdinWriter) Close() os.Error {
-	return w.writePacket(marshal(msgChannelEOF, &channelEOFMsg{w.id}))
+	return w.writePacket(marshal(msgChannelEOF, channelEOFMsg{w.id}))
 }
 
+// Represents the stdout stream from the remote peer.
 type stdoutReader struct {
 	data         chan []byte // receives data from remote
 	id           uint32
@@ -532,33 +538,41 @@ type stdoutReader struct {
 	buf          []byte
 }
 
+// Read data from stdout on the remote session.
 func (r *stdoutReader) Read(data []byte) (int, os.Error) {
+	var ok bool
 	for {
 		if len(r.buf) > 0 {
 			n := copy(data, r.buf)
 			r.buf = r.buf[n:]
 			r.win += n
-			err := r.writePacket(marshal(msgChannelWindowAdjust, &windowAdjustMsg{
+			msg := windowAdjustMsg{
 				PeersId:         r.id,
 				AdditionalBytes: uint32(n),
-			}))
+			}
+			err := r.writePacket(marshal(msgChannelWindowAdjust, msg))
 			return n, err
 		}
-		r.buf = []byte(<-r.data)
+		r.buf, ok = <-r.data
+		if !ok {
+			return 0, os.EOF
+		}
 		r.win -= len(r.buf)
 	}
 	panic("unreachable")
 }
 
 func (r *stdoutReader) Close() os.Error {
-	return r.writePacket(marshal(msgChannelEOF, &channelEOFMsg{r.id}))
+	return r.writePacket(marshal(msgChannelEOF, channelEOFMsg{r.id}))
 }
 
+// Represents the stderr stream from the remote peer.
 type stderrReader struct {
 	dataExt chan string // receives dataExt from remote
 	buf     []byte      // buffer current dataExt
 }
 
+// Read a line of data from stderr on the remote session.
 func (r *stderrReader) Read(data []byte) (int, os.Error) {
 	for {
 		if len(r.buf) > 0 {
@@ -566,7 +580,11 @@ func (r *stderrReader) Read(data []byte) (int, os.Error) {
 			r.buf = r.buf[n:]
 			return n, nil
 		}
-		r.buf = []byte(<-r.dataExt)
+		buf, ok := <-r.dataExt
+		if !ok {
+			return 0, os.EOF
+		}
+		r.buf = []byte(buf)
 	}
 	panic("unreachable")
 }
