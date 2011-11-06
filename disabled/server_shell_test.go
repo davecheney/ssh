@@ -5,8 +5,8 @@
 package ssh
 
 import (
-	"testing"
 	"os"
+	"testing"
 )
 
 type MockChannel struct {

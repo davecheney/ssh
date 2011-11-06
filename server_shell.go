@@ -4,9 +4,7 @@
 
 package ssh
 
-import (
-	"os"
-)
+import "io"
 
 // ServerShell contains the state for running a VT100 terminal that is capable
 // of reading lines of input.
@@ -326,12 +324,12 @@ func parsePtyRequest(s []byte) (width, height int, ok bool) {
 	return
 }
 
-func (ss *ServerShell) Write(buf []byte) (n int, err os.Error) {
+func (ss *ServerShell) Write(buf []byte) (n int, err error) {
 	return ss.c.Write(buf)
 }
 
 // ReadLine returns a line of input from the terminal.
-func (ss *ServerShell) ReadLine() (line string, err os.Error) {
+func (ss *ServerShell) ReadLine() (line string, err error) {
 	ss.writeLine([]byte(ss.prompt))
 	ss.c.Write(ss.outBuf)
 	ss.outBuf = ss.outBuf[:0]
@@ -340,7 +338,8 @@ func (ss *ServerShell) ReadLine() (line string, err os.Error) {
 		// ss.remainder is a slice at the beginning of ss.inBuf
 		// containing a partial key sequence
 		readBuf := ss.inBuf[len(ss.remainder):]
-		n, err := ss.c.Read(readBuf)
+		var n int
+		n, err = ss.c.Read(readBuf)
 		if err == nil {
 			ss.remainder = ss.inBuf[:n+len(ss.remainder)]
 			rest := ss.remainder
@@ -352,7 +351,7 @@ func (ss *ServerShell) ReadLine() (line string, err os.Error) {
 					break
 				}
 				if key == keyCtrlD {
-					return "", os.EOF
+					return "", io.EOF
 				}
 				line, lineOk = ss.handleKey(key)
 			}

@@ -4,49 +4,39 @@
 
 package ssh
 
+// ClientConn functional tests.
+// These tests require a running ssh server listening on port 22
+// on the local host. Functional tests will be skipped unless 
+// -ssh.user and -ssh.pass must be passed to gotest.
+
 import (
-	"log"
+	"flag"
 	"testing"
-	"os"
 )
 
-func TestClientConnect(t *testing.T) {
+var (
+	sshuser = flag.String("ssh.user", "", "ssh username")
+	sshpass = flag.String("ssh.pass", "", "ssh password")
+)
+
+type pw string
+
+func (p pw) Password(id string) (string, error) {
+	return string(p), nil
+}
+
+func TestDial(t *testing.T) {
+	if *sshuser == "" {
+		t.Log("ssh.user not defined, skipping test")
+		return
+	}
 	config := &ClientConfig{
-		User:                  os.Getenv("USER"),
-		Password:              os.Getenv("PASSWD"),
-		SupportedKexAlgos:     supportedKexAlgos,
-		SupportedHostKeyAlgos: supportedHostKeyAlgos,
-		SupportedCiphers:      supportedCiphers,
-		SupportedMACs:         supportedMACs,
-		SupportedCompressions: supportedCompressions,
+		User: *sshuser,
+		Auth: []ClientAuth{ClientAuthPassword(pw(*sshpass))},
 	}
-	conn, err := Dial("localhost:22", config)
+	conn, err := Dial("tcp", "localhost:22", config)
 	if err != nil {
-		log.Fatal(err)
+		t.Fatalf("Unable to connect: %s", err)
 	}
-	log.Printf("%#v", config)
 	defer conn.Close()
-	ch, err := conn.OpenChan("session")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer ch.Close()
-	if err := ch.Setenv("LANG", "C"); err != nil {
-		log.Fatal(err)
-	}
-	if err := ch.Ptyreq("vt100", 80, 24); err != nil {
-		log.Fatal(err)
-	}
-	if err := ch.Exec("/bin/cat"); err != nil {
-		log.Fatal(err)
-	}
-	if _, err := ch.Write([]byte("Hello world!")); err != nil {
-		log.Fatal(err)
-	}
-	buf := make([]byte, 1024)
-	read, err := ch.Read(buf)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println(string(buf[:read]))
 }
