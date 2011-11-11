@@ -39,9 +39,9 @@ func newBuffer() *buffer {
 	return b
 }
 
-// Write makes buf available for Read to receive.
+// push makes buf available for Read to receive.
 // buf must not be modified after the call to Write.
-func (b *buffer) Write(buf []byte) (int, error) {
+func (b *buffer) push(buf []byte) (int, error) {
 	b.Cond.L.Lock()
 	defer b.Cond.L.Unlock()
 	e := &element{buf: buf}
@@ -62,36 +62,16 @@ func (b *buffer) Close() error {
 	return nil
 }
 
-// Read reads data from the internal buffer in buf. 
-// Reads will block if not data is available, or until
-// Close is called.
-func (b *buffer) Read(buf []byte) (n int, err error) {
+func (b *buffer) pop() (buf []byte, err error) {
 	b.Cond.L.Lock()
 	defer b.Cond.L.Unlock()
 	for {
-		// if there is data in b.head, copy it
-		if len(b.head.buf) > 0 {
-			r := copy(buf, b.head.buf)
-			buf, b.head.buf = buf[r:], b.head.buf[r:]
-			n += r
-			if len(buf) == 0 {
-				// dest full
-				break
-			}
-			continue
-		}
-		// if there is a next buffer, make it the head
-		if len(b.head.buf) == 0 && b.head != b.tail {
-			b.head = b.head.next
-			continue
-		}
-		// if at least one byte has been copied return
-		if n > 0 {
-			break
-		}
-		// out of buffers, wait for producer
 		if b.eof {
 			err = io.EOF
+			break
+		}
+		if b.head.buf != nil {
+			buf, b.head = b.head.buf, b.head.next
 			break
 		}
 		b.Cond.Wait()

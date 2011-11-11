@@ -5,7 +5,6 @@
 package ssh
 
 import (
-	"big"
 	"bytes"
 	"crypto"
 	"crypto/rand"
@@ -14,6 +13,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"sync"
 )
@@ -383,9 +383,11 @@ func (s *ServerConn) Handshake() error {
 		return err
 	}
 
-	if err = s.authenticate(H); err != nil {
+	if err := s.authenticate(H); err != nil {
+		println(err.Error())
 		return err
 	}
+	println("zaro boogs foond")
 	return nil
 }
 
@@ -475,7 +477,6 @@ userAuthLoop:
 				return ParseError{msgUserAuthRequest}
 			}
 			algo := string(algoBytes)
-
 			pubKey, payload, ok := parseString(payload)
 			if !ok {
 				return ParseError{msgUserAuthRequest}
@@ -519,7 +520,7 @@ userAuthLoop:
 					if !ok {
 						return ParseError{msgUserAuthRequest}
 					}
-					if rsa.VerifyPKCS1v15(rsaKey, hashFunc, digest, rsaSig) != nil {
+					if err := rsa.VerifyPKCS1v15(rsaKey, hashFunc, digest, rsaSig); err != nil {
 						return ParseError{msgUserAuthRequest}
 					}
 				default:
