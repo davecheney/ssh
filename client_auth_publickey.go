@@ -35,7 +35,7 @@ func (p *publicKeyAuth) auth(session []byte, user string, t *transport) (bool, [
 		Reply    bool
 		Algoname string
 		Blob     string
-		Sig      []byte `rest`
+		Sig      []byte
 	}
 
 	for i := 0; ; i++ {
@@ -43,24 +43,12 @@ func (p *publicKeyAuth) auth(session []byte, user string, t *transport) (bool, [
 		if err != nil {
 			break
 		}
-		algoBytes := make([]byte, stringLength([]byte(alg)))
-		marshalString(algoBytes, []byte(alg))
-		var length int
-		for _, j := range pub {
-			length += intLength(j)
-		}
-		pubKey := make([]byte, length)
-		s := pubKey
-		for _, j := range pub {
-			s = marshalInt(s, j)
-		}
-		stringPubKey := make([]byte, stringLength(pubKey))
-		marshalString(stringPubKey, pubKey)
+		pubkey := serializePublickey(alg, pub)
 		sig, err := p.Sign(i, buildDataSignedForAuth(session, userAuthRequestMsg{
 			User:    user,
 			Service: serviceSSH,
 			Method:  p.method(),
-		}, []byte(alg), append(algoBytes, pubKey...)))
+		}, []byte(alg), pubkey))
 		if err != nil {
 			return false, nil, err
 		}
@@ -70,7 +58,7 @@ func (p *publicKeyAuth) auth(session []byte, user string, t *transport) (bool, [
 			Method:   p.method(),
 			Reply:    true,
 			Algoname: alg,
-			Blob:     string(append(algoBytes, pubKey...)),
+			Blob:     string(pubkey),
 			Sig:      serializeRSASignature(sig),
 		}
 		p := marshal(msgUserAuthRequest, msg)
@@ -101,4 +89,17 @@ func (p *publicKeyAuth) method() string {
 // ClientAuthPublicKey returns a ClientAuth using public key authentication.
 func ClientAuthPublicKey(impl ClientPublicKey) ClientAuth {
 	return &publicKeyAuth{impl}
+}
+
+func serializePublickey(alg string, pub []*big.Int) []byte {
+	length := stringLength([]byte(alg))
+	for _, i := range pub {
+		length += intLength(i)
+	}
+	ret := make([]byte, length)
+	key := marshalString(ret, []byte(alg))
+	for _, i := range pub {
+		key = marshalInt(key, i)
+	}
+	return ret
 }
