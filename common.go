@@ -127,3 +127,59 @@ func findAgreedAlgorithms(transport *transport, clientKexInit, serverKexInit *ke
 	ok = true
 	return
 }
+
+// serialize an RSA signed slice according to RFC 4254 6.6.
+func serializeRSASignature(sig []byte) []byte {
+	length := stringLength([]byte(hostAlgoRSA))
+	length += stringLength(sig)
+
+	ret := make([]byte, length)
+	r := marshalString(ret, []byte(hostAlgoRSA))
+	r = marshalString(r, sig)
+
+	return ret
+}
+
+// serialize a slice of *big.Ints according to RFC 4253 6.6.
+func serializePublickey(alg string, pub []*big.Int) []byte {
+	length := stringLength([]byte(alg))
+	for _, i := range pub {
+		length += intLength(i)
+	}
+	ret := make([]byte, length)
+	key := marshalString(ret, []byte(alg))
+	for _, i := range pub {
+		key = marshalInt(key, i)
+	}
+	return ret
+}
+
+// buildDataSignedForAuth returns the data that is signed in order to prove
+// posession of a private key. See RFC 4252, section 7.
+func buildDataSignedForAuth(sessionId []byte, req userAuthRequestMsg, algo, pubKey []byte) []byte {
+	user := []byte(req.User)
+	service := []byte(req.Service)
+	method := []byte(req.Method)
+
+	length := stringLength(sessionId)
+	length += 1
+	length += stringLength(user)
+	length += stringLength(service)
+	length += stringLength(method)
+	length += 1
+	length += stringLength(algo)
+	length += stringLength(pubKey)
+
+	ret := make([]byte, length)
+	r := marshalString(ret, sessionId)
+	r[0] = msgUserAuthRequest
+	r = r[1:]
+	r = marshalString(r, user)
+	r = marshalString(r, service)
+	r = marshalString(r, method)
+	r[0] = 1
+	r = r[1:]
+	r = marshalString(r, algo)
+	r = marshalString(r, pubKey)
+	return ret
+}

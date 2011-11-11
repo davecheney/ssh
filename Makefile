@@ -9,7 +9,6 @@ GOFILES=\
 	channel.go\
 	client.go\
 	client_auth.go\
-	client_auth_publickey.go\
 	common.go\
 	keychain.go\
 	messages.go\

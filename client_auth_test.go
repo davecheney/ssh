@@ -5,6 +5,7 @@
 package ssh
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -40,6 +41,16 @@ gqnBycHj6AhEycjda75cs+0zybZvN4x65KZHOGW/O/7OAWEcZP5TPb3zf9ned3Hl
 NsZoFj52ponUM6+99A2CmezFCN16c4mbA//luWF+k3VVqR6BpkrhKw==
 -----END RSA PRIVATE KEY-----`
 
+// reused internally by tests
+var serverConfig = new(ServerConfig)
+
+func init() {
+	if err := serverConfig.SetRSAPrivateKey([]byte(_pem)); err != nil {
+		panic("unable to set private key: " + err.Error())
+	}
+}
+
+// keychain implements the ClientPublickey interface
 type keychain struct {
 	keys []*rsa.PrivateKey
 }
@@ -53,7 +64,6 @@ func (k *keychain) Key(i int) (string, []*big.Int, error) {
 	return "ssh-rsa", []*big.Int{e, pub.N}, nil
 }
 
-// Sign returns a signature of the given data using the i'th key.
 func (k *keychain) Sign(i int, data []byte) (sig []byte, err error) {
 	hashFunc := crypto.SHA1
 	h := hashFunc.New()
@@ -62,32 +72,33 @@ func (k *keychain) Sign(i int, data []byte) (sig []byte, err error) {
 	return rsa.SignPKCS1v15(rand.Reader, k.keys[i], hashFunc, digest)
 }
 
-func TestClientPubkeyAuth(t *testing.T) {
-	pkey, err := rsa.GenerateKey(rand.Reader, 512)
-	if err != nil {
-		t.Fatalf("unable to generate private key: %s", err)
-	}
-	t.Log("public key generated")
+var pkey *rsa.PrivateKey
 
+func init() {
+	var err error
+	pkey, err = rsa.GenerateKey(rand.Reader, 512)
+	if err != nil {
+		panic("unable to generate public key")
+	}
+}
+
+func TestClientAuthPublickey(t *testing.T) {
 	k := new(keychain)
 	k.keys = append(k.keys, pkey)
 
-	sConfig := &ServerConfig{
-		PubKeyCallback: func(user, algo string, pubkey []byte) bool {
-			t.Logf("%s, %s, %v", user, algo, pubkey)
-			return true
-		},
+	serverConfig.PubKeyCallback = func(user, algo string, pubkey []byte) bool {
+		alg, pub, _ := k.Key(0)
+		expected := serializePublickey(alg, pub)
+		return user == "testuser" && algo == alg && bytes.Equal(pubkey, expected)
 	}
+	serverConfig.PasswordCallback = nil
 
-	if err := sConfig.SetRSAPrivateKey([]byte(_pem)); err != nil {
-		t.Fatalf("Failed to parse private key: %s", err)
-	}
-
-	l, err := Listen("tcp", "0.0.0.0:0", sConfig)
+	l, err := Listen("tcp", "0.0.0.0:0", serverConfig)
 	if err != nil {
 		t.Fatalf("unable to listen: %s", err)
 	}
-	t.Logf("Listening on %s", l.Addr())
+	defer l.Close()
+
 	done := make(chan bool)
 	go func() {
 		c, err := l.Accept()
@@ -103,10 +114,112 @@ func TestClientPubkeyAuth(t *testing.T) {
 
 	config := &ClientConfig{
 		User: "testuser",
-		Auth: []ClientAuth{ClientAuthPublicKey(k)},
+		Auth: []ClientAuth{
+			ClientAuthPublicKey(k),
+		},
 	}
 
-	t.Logf("Dialing %s", l.Addr())
+	c, err := Dial("tcp", l.Addr().String(), config)
+	if err != nil {
+		t.Errorf("unable to dial remote side: %s", err)
+	}
+	defer c.Close()
+	<-done
+}
+
+// password implements the ClientPassword interface
+type password string
+
+func (p *password) Password(user string) (string, error) {
+	return string(*p), nil
+}
+
+func TestClientAuthPassword(t *testing.T) {
+	pw := password("tiger")
+
+	serverConfig.PasswordCallback = func(user, pass string) bool {
+		return user == "testuser" && pass == string(pw)
+	}
+	serverConfig.PubKeyCallback = nil
+
+	l, err := Listen("tcp", "0.0.0.0:0", serverConfig)
+	if err != nil {
+		t.Fatalf("unable to listen: %s", err)
+	}
+	defer l.Close()
+
+	done := make(chan bool)
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Handshake(); err != nil {
+			t.Error(err)
+		}
+		defer c.Close()
+		done <- true
+	}()
+
+	config := &ClientConfig{
+		User: "testuser",
+		Auth: []ClientAuth{
+			ClientAuthPassword(&pw),
+		},
+	}
+
+	c, err := Dial("tcp", l.Addr().String(), config)
+	if err != nil {
+		t.Errorf("unable to dial remote side: %s", err)
+	}
+	defer c.Close()
+	<-done
+}
+
+func TestClientAuthPasswordAndPublickey(t *testing.T) {
+	pw := password("tiger")
+
+	serverConfig.PasswordCallback = func(user, pass string) bool {
+		return user == "testuser" && pass == string(pw)
+	}
+
+	k := new(keychain)
+	k.keys = append(k.keys, pkey)
+
+	serverConfig.PubKeyCallback = func(user, algo string, pubkey []byte) bool {
+		alg, pub, _ := k.Key(0)
+		expected := serializePublickey(alg, pub)
+		return user == "testuser" && algo == alg && bytes.Equal(pubkey, expected)
+	}
+
+	l, err := Listen("tcp", "0.0.0.0:0", serverConfig)
+	if err != nil {
+		t.Fatalf("unable to listen: %s", err)
+	}
+	defer l.Close()
+
+	done := make(chan bool)
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Handshake(); err != nil {
+			t.Error(err)
+		}
+		defer c.Close()
+		done <- true
+	}()
+
+	wrongPw := password("wrong")
+	config := &ClientConfig{
+		User: "testuser",
+		Auth: []ClientAuth{
+			ClientAuthPassword(&wrongPw),
+			ClientAuthPublicKey(k),
+		},
+	}
+
 	c, err := Dial("tcp", l.Addr().String(), config)
 	if err != nil {
 		t.Errorf("unable to dial remote side: %s", err)

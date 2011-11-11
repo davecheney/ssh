@@ -234,49 +234,8 @@ func (s *ServerConn) kexDH(group *dhGroup, hashFunc crypto.Hash, magics *handsha
 	return
 }
 
-func serializeRSASignature(sig []byte) []byte {
-	length := stringLength([]byte(hostAlgoRSA))
-	length += stringLength(sig)
-
-	ret := make([]byte, length)
-	r := marshalString(ret, []byte(hostAlgoRSA))
-	r = marshalString(r, sig)
-
-	return ret
-}
-
 // serverVersion is the fixed identification string that Server will use.
 var serverVersion = []byte("SSH-2.0-Go\r\n")
-
-// buildDataSignedForAuth returns the data that is signed in order to prove
-// posession of a private key. See RFC 4252, section 7.
-func buildDataSignedForAuth(sessionId []byte, req userAuthRequestMsg, algo, pubKey []byte) []byte {
-	user := []byte(req.User)
-	service := []byte(req.Service)
-	method := []byte(req.Method)
-
-	length := stringLength(sessionId)
-	length += 1
-	length += stringLength(user)
-	length += stringLength(service)
-	length += stringLength(method)
-	length += 1
-	length += stringLength(algo)
-	length += stringLength(pubKey)
-
-	ret := make([]byte, length)
-	r := marshalString(ret, sessionId)
-	r[0] = msgUserAuthRequest
-	r = r[1:]
-	r = marshalString(r, user)
-	r = marshalString(r, service)
-	r = marshalString(r, method)
-	r[0] = 1
-	r = r[1:]
-	r = marshalString(r, algo)
-	r = marshalString(r, pubKey)
-	return ret
-}
 
 // Handshake performs an SSH transport and client authentication on the given ServerConn.
 func (s *ServerConn) Handshake() error {
@@ -383,11 +342,9 @@ func (s *ServerConn) Handshake() error {
 		return err
 	}
 
-	if err := s.authenticate(H); err != nil {
-		println(err.Error())
+	if err = s.authenticate(H); err != nil {
 		return err
 	}
-	println("zaro boogs foond")
 	return nil
 }
 
@@ -477,6 +434,7 @@ userAuthLoop:
 				return ParseError{msgUserAuthRequest}
 			}
 			algo := string(algoBytes)
+
 			pubKey, payload, ok := parseString(payload)
 			if !ok {
 				return ParseError{msgUserAuthRequest}
@@ -520,7 +478,7 @@ userAuthLoop:
 					if !ok {
 						return ParseError{msgUserAuthRequest}
 					}
-					if err := rsa.VerifyPKCS1v15(rsaKey, hashFunc, digest, rsaSig); err != nil {
+					if rsa.VerifyPKCS1v15(rsaKey, hashFunc, digest, rsaSig) != nil {
 						return ParseError{msgUserAuthRequest}
 					}
 				default:
