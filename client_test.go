@@ -15,28 +15,42 @@ import (
 )
 
 var (
-	sshuser = flag.String("ssh.user", "", "ssh username")
-	sshpass = flag.String("ssh.pass", "", "ssh password")
+	sshuser    = flag.String("ssh.user", "", "ssh username")
+	sshpass    = flag.String("ssh.pass", "", "ssh password")
+	sshpubkey  = flag.String("ssh.pubkey", "", "ssh pubkey file")
+	sshprivkey = flag.String("ssh.privkey", "", "ssh privkey file")
 )
 
-type pw string
-
-func (p pw) Password(id string) (string, error) {
-	return string(p), nil
-}
-
-func TestDial(t *testing.T) {
+func TestPasswordAuth(t *testing.T) {
 	if *sshuser == "" {
 		t.Log("ssh.user not defined, skipping test")
 		return
 	}
 	config := &ClientConfig{
 		User: *sshuser,
-		Auth: []ClientAuth{ClientAuthPassword(pw(*sshpass))},
+		Auth: []ClientAuth{ClientAuthPassword(password(*sshpass))},
 	}
 	conn, err := Dial("tcp", "localhost:22", config)
 	if err != nil {
 		t.Fatalf("Unable to connect: %s", err)
+	}
+	defer conn.Close()
+}
+
+func TestPublicKeyAuth(t *testing.T) {
+	if *sshuser == "" {
+		t.Log("ssh.user not defined, skipping test")
+		return
+	}
+	kc := new(keychain)
+
+	config := &ClientConfig{
+		User: *sshuser,
+		Auth: []ClientAuth{ClientAuthPublickey(kc)},
+	}
+	conn, err := Dial("tcp", "localhost:22", config)
+	if err != nil {
+		t.Fatalf("unable to connect: %2", err)
 	}
 	defer conn.Close()
 }

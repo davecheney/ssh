@@ -9,7 +9,6 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
-	"math/big"
 	"testing"
 )
 
@@ -55,13 +54,11 @@ type keychain struct {
 	keys []*rsa.PrivateKey
 }
 
-func (k *keychain) Key(i int) (string, []*big.Int, error) {
+func (k *keychain) Key(i int) (interface{}, error) {
 	if i < 0 || i >= len(k.keys) {
-		return "", nil, ErrNoKeys
+		return nil, nil
 	}
-	pub := k.keys[i].PublicKey
-	e := new(big.Int).SetInt64(int64(pub.E))
-	return "ssh-rsa", []*big.Int{e, pub.N}, nil
+	return k.keys[i].PublicKey, nil
 }
 
 func (k *keychain) Sign(i int, data []byte) (sig []byte, err error) {
@@ -87,9 +84,9 @@ func TestClientAuthPublickey(t *testing.T) {
 	k.keys = append(k.keys, pkey)
 
 	serverConfig.PubKeyCallback = func(user, algo string, pubkey []byte) bool {
-		alg, pub, _ := k.Key(0)
-		expected := serializePublickey(alg, pub)
-		return user == "testuser" && algo == alg && bytes.Equal(pubkey, expected)
+		expected := []byte(serializePublickey(k.keys[0].PublicKey))
+		algoname := algoName(k.keys[0].PublicKey)
+		return user == "testuser" && algo == algoname && bytes.Equal(pubkey, expected)
 	}
 	serverConfig.PasswordCallback = nil
 
@@ -115,7 +112,7 @@ func TestClientAuthPublickey(t *testing.T) {
 	config := &ClientConfig{
 		User: "testuser",
 		Auth: []ClientAuth{
-			ClientAuthPublicKey(k),
+			ClientAuthPublickey(k),
 		},
 	}
 
@@ -130,8 +127,8 @@ func TestClientAuthPublickey(t *testing.T) {
 // password implements the ClientPassword interface
 type password string
 
-func (p *password) Password(user string) (string, error) {
-	return string(*p), nil
+func (p password) Password(user string) (string, error) {
+	return string(p), nil
 }
 
 func TestClientAuthPassword(t *testing.T) {
@@ -164,7 +161,7 @@ func TestClientAuthPassword(t *testing.T) {
 	config := &ClientConfig{
 		User: "testuser",
 		Auth: []ClientAuth{
-			ClientAuthPassword(&pw),
+			ClientAuthPassword(pw),
 		},
 	}
 
@@ -187,9 +184,9 @@ func TestClientAuthPasswordAndPublickey(t *testing.T) {
 	k.keys = append(k.keys, pkey)
 
 	serverConfig.PubKeyCallback = func(user, algo string, pubkey []byte) bool {
-		alg, pub, _ := k.Key(0)
-		expected := serializePublickey(alg, pub)
-		return user == "testuser" && algo == alg && bytes.Equal(pubkey, expected)
+		expected := []byte(serializePublickey(k.keys[0].PublicKey))
+		algoname := algoName(k.keys[0].PublicKey)
+		return user == "testuser" && algo == algoname && bytes.Equal(pubkey, expected)
 	}
 
 	l, err := Listen("tcp", "0.0.0.0:0", serverConfig)
@@ -215,8 +212,8 @@ func TestClientAuthPasswordAndPublickey(t *testing.T) {
 	config := &ClientConfig{
 		User: "testuser",
 		Auth: []ClientAuth{
-			ClientAuthPassword(&wrongPw),
-			ClientAuthPublicKey(k),
+			ClientAuthPassword(wrongPw),
+			ClientAuthPublickey(k),
 		},
 	}
 

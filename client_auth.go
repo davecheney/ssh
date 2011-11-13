@@ -6,7 +6,7 @@ package ssh
 
 import (
 	"errors"
-	"math/big"
+	"io"
 )
 
 // authenticate authenticates with the remote server. See RFC 4252. 
@@ -157,64 +157,108 @@ func ClientAuthPassword(impl ClientPassword) ClientAuth {
 	return &passwordAuth{impl}
 }
 
-var ErrNoKeys = errors.New("No more keys")
-
-// A ClientPublicKey implements access to a client key ring.
-type ClientPublicKey interface {
-	// Key returns the i'th key, or ssh.ErrNoKeys if there is no i'th key.
-	// The algorithm is typically "ssh-rsa" or "ssh-dsa".
-	// For "ssh-rsa" the pub list is {ek, mod}.
-	// For "ssh-dsa" the pub list is {p, q, alpha, key}.
-	Key(i int) (alg string, pub []*big.Int, err error)
+// ClientKeyring implements access to a client key ring.
+type ClientKeyring interface {
+	// Key returns the i'th rsa.Publickey or dsa.Publickey, or nil if 
+	// no key exists at i.
+	Key(i int) (key interface{}, err error)
 
 	// Sign returns a signature of the given data using the i'th key.
 	Sign(i int, data []byte) (sig []byte, err error)
 }
 
 // "publickey" authentication, RFC 4252 Section 7.
-type publicKeyAuth struct {
-	ClientPublicKey
+type publickeyAuth struct {
+	ClientKeyring
 }
 
-func (p *publicKeyAuth) auth(session []byte, user string, t *transport) (bool, []string, error) {
+func (p *publickeyAuth) auth(session []byte, user string, t *transport) (bool, []string, error) {
 	type publickeyAuthMsg struct {
-		User     string
-		Service  string
-		Method   string
-		Reply    bool
+		User    string
+		Service string
+		Method  string
+		// HasSig indicates to the reciver of this packet that the auth request is signed and
+		// should be used for authentication of the request.
+		HasSig   bool
 		Algoname string
-		Blob     string
-		Sig      []byte
+		Pubkey   string
+		// Sig is defined as []byte so marshal will exclude it during the query phase
+		Sig []byte `ssh:"rest"`
 	}
 
-	// methods that may continue if this auth is not successful.
-	var methods []string
+	// Authentication is performed in two stages. The first stage sends an
+	// enquiry to test if each key is acceptable to the remote. The second
+	// stage attempts to authenticate with the valid keys obtained in the 
+	// first stage.
 
-	for i := 0; ; i++ {
-		alg, pub, err := p.Key(i)
-		if err != nil {
-			if err == ErrNoKeys {
-				break
-			}
-			return false, nil, err
-		}
-		pubkey := serializePublickey(alg, pub)
-		sig, err := p.Sign(i, buildDataSignedForAuth(session, userAuthRequestMsg{
-			User:    user,
-			Service: serviceSSH,
-			Method:  p.method(),
-		}, []byte(alg), pubkey))
+	var index int
+	// a map of public keys to their index in the keyring 
+	validKeys := make(map[int]interface{})
+	for {
+		key, err := p.Key(index)
 		if err != nil {
 			return false, nil, err
 		}
+		if key == nil {
+			// no more keys in the keyring
+			break
+		}
+		pubkey := serializePublickey(key)
+		algoname := algoName(key)
 		msg := publickeyAuthMsg{
 			User:     user,
 			Service:  serviceSSH,
 			Method:   p.method(),
-			Reply:    true,
-			Algoname: alg,
-			Blob:     string(pubkey),
-			Sig:      serializeRSASignature(sig),
+			HasSig:   false,
+			Algoname: algoname,
+			Pubkey:   string(pubkey),
+		}
+		if err := t.writePacket(marshal(msgUserAuthRequest, msg)); err != nil {
+			return false, nil, err
+		}
+		packet, err := t.readPacket()
+		if err != nil {
+			return false, nil, err
+		}
+		switch packet[0] {
+		case msgUserAuthPubKeyOk:
+			msg := decode(packet).(*userAuthPubKeyOkMsg)
+			if msg.Algo != algoname || msg.PubKey != string(pubkey) {
+				continue
+			}
+			validKeys[index] = key
+		case msgUserAuthFailure:
+		default:
+			return false, nil, UnexpectedMessageError{msgUserAuthSuccess, packet[0]}
+		}
+		index++
+	}
+
+	// methods that may continue if this auth is not successful.
+	var methods []string
+	for i, key := range validKeys {
+		pubkey := serializePublickey(key)
+		algoname := algoName(key)
+		sign, err := p.Sign(i, buildDataSignedForAuth(session, userAuthRequestMsg{
+			User:    user,
+			Service: serviceSSH,
+			Method:  p.method(),
+		}, []byte(algoname), pubkey))
+		if err != nil {
+			return false, nil, err
+		}
+		// manually wrap the serialized signature in a string
+		s := serializeSignature(algoname, sign)
+		sig := make([]byte, stringLength(s))
+		marshalString(sig, s)
+		msg := publickeyAuthMsg{
+			User:     user,
+			Service:  serviceSSH,
+			Method:   p.method(),
+			HasSig:   true,
+			Algoname: algoname,
+			Pubkey:   string(pubkey),
+			Sig:      sig,
 		}
 		p := marshal(msgUserAuthRequest, msg)
 		if err := t.writePacket(p); err != nil {
@@ -231,6 +275,8 @@ func (p *publicKeyAuth) auth(session []byte, user string, t *transport) (bool, [
 			msg := decode(packet).(*userAuthFailureMsg)
 			methods = msg.Methods
 			continue
+		case msgDisconnect:
+			return false, nil, io.EOF
 		default:
 			return false, nil, UnexpectedMessageError{msgUserAuthSuccess, packet[0]}
 		}
@@ -238,11 +284,11 @@ func (p *publicKeyAuth) auth(session []byte, user string, t *transport) (bool, [
 	return false, methods, nil
 }
 
-func (p *publicKeyAuth) method() string {
+func (p *publickeyAuth) method() string {
 	return "publickey"
 }
 
-// ClientAuthPublicKey returns a ClientAuth using public key authentication.
-func ClientAuthPublicKey(impl ClientPublicKey) ClientAuth {
-	return &publicKeyAuth{impl}
+// ClientAuthPublickey returns a ClientAuth using public key authentication.
+func ClientAuthPublickey(impl ClientKeyring) ClientAuth {
+	return &publickeyAuth{impl}
 }

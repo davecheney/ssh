@@ -15,6 +15,7 @@ GOFILES=\
 	server.go\
 	server_shell.go\
 	session.go\
+	tcpip.go\
 	transport.go\
 	queue.go\
 

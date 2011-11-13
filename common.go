@@ -5,6 +5,8 @@
 package ssh
 
 import (
+	"crypto/dsa"
+	"crypto/rsa"
 	"math/big"
 	"strconv"
 	"sync"
@@ -128,30 +130,57 @@ func findAgreedAlgorithms(transport *transport, clientKexInit, serverKexInit *ke
 	return
 }
 
-// serialize an RSA signed slice according to RFC 4254 6.6.
-func serializeRSASignature(sig []byte) []byte {
-	length := stringLength([]byte(hostAlgoRSA))
+// serialize a signed slice according to RFC 4254 6.6.
+func serializeSignature(algoname string, sig []byte) []byte {
+	length := stringLength([]byte(algoname))
 	length += stringLength(sig)
 
 	ret := make([]byte, length)
-	r := marshalString(ret, []byte(hostAlgoRSA))
+	r := marshalString(ret, []byte(algoname))
 	r = marshalString(r, sig)
 
 	return ret
 }
 
-// serialize a slice of *big.Ints according to RFC 4253 6.6.
-func serializePublickey(alg string, pub []*big.Int) []byte {
-	length := stringLength([]byte(alg))
-	for _, i := range pub {
-		length += intLength(i)
+// serialize an rsa.PublicKey or dsa.PublicKey according to RFC 4253 6.6.
+func serializePublickey(key interface{}) []byte {
+	algoname := algoName(key)
+	switch key := key.(type) {
+	case rsa.PublicKey:
+		e := new(big.Int).SetInt64(int64(key.E))
+		length := stringLength([]byte(algoname))
+		length += intLength(e)
+		length += intLength(key.N)
+		ret := make([]byte, length)
+		r := marshalString(ret, []byte(algoname))
+		r = marshalInt(r, e)
+		marshalInt(r, key.N)
+		return ret
+	case dsa.PublicKey:
+		length := stringLength([]byte(algoname))
+		length += intLength(key.P)
+		length += intLength(key.Q)
+		length += intLength(key.G)
+		length += intLength(key.Y)
+		ret := make([]byte, length)
+		r := marshalString(ret, []byte(algoname))
+		r = marshalInt(r, key.P)
+		r = marshalInt(r, key.Q)
+		r = marshalInt(r, key.G)
+		marshalInt(r, key.Y)
+		return ret
 	}
-	ret := make([]byte, length)
-	key := marshalString(ret, []byte(alg))
-	for _, i := range pub {
-		key = marshalInt(key, i)
+	panic("unexpected key type")
+}
+
+func algoName(key interface{}) string {
+	switch key.(type) {
+	case rsa.PublicKey:
+		return "ssh-rsa"
+	case dsa.PublicKey:
+		return "ssh-dss"
 	}
-	return ret
+	panic("unexpected key type")
 }
 
 // buildDataSignedForAuth returns the data that is signed in order to prove

@@ -221,7 +221,7 @@ func (s *ServerConn) kexDH(group *dhGroup, hashFunc crypto.Hash, magics *handsha
 		return nil, nil, errors.New("internal error")
 	}
 
-	serializedSig := serializeRSASignature(sig)
+	serializedSig := serializeSignature(hostAlgoRSA, sig)
 
 	kexDHReply := kexDHReplyMsg{
 		HostKey:   serializedHostKey,
