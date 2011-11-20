@@ -9,15 +9,15 @@ import (
 	"sync"
 )
 
-// buffer provides a linked list buffer for data exchange
-// between producer and consumer. Theoretically the buffer is
+// readbuf provides a linked list readbuf for data exchange
+// between producer and consumer. Theoretically the readbuf is
 // of unlimited capacity as it does no allocation of its own.
-type buffer struct {
+type readbuf struct {
 	// protects concurrent access to head, tail and eof
 	*sync.Cond
 
-	head *element // the buffer that will be read first
-	tail *element // the buffer that will be read last
+	head *element // the readbuf that will be read first
+	tail *element // the readbuf that will be read last
 
 	eof bool // 
 }
@@ -28,10 +28,9 @@ type element struct {
 	next *element
 }
 
-// newBuffer returns an empty buffer that is not closed.
-func newBuffer() *buffer {
+func newReadBuf() *readbuf {
 	e := new(element)
-	b := &buffer{
+	b := &readbuf{
 		Cond: sync.NewCond(new(sync.Mutex)),
 		head: e,
 		tail: e,
@@ -41,7 +40,7 @@ func newBuffer() *buffer {
 
 // write makes buf available for Read to receive.
 // buf must not be modified after the call to write.
-func (b *buffer) write(buf []byte) (int, error) {
+func (b *readbuf) write(buf []byte) (int, error) {
 	b.Cond.L.Lock()
 	defer b.Cond.L.Unlock()
 	e := &element{buf: buf}
@@ -51,21 +50,17 @@ func (b *buffer) write(buf []byte) (int, error) {
 	return len(buf), nil
 }
 
-// Close closes the buffer. Reads from the buffer 
-// after all the data has been consumed wiil receive
-// os.EOF.
-func (b *buffer) Close() error {
+func (b *readbuf) close() {
 	b.Cond.L.Lock()
 	defer b.Cond.L.Unlock()
 	b.eof = true
 	b.Cond.Signal()
-	return nil
 }
 
-// Read reads data from the internal buffer in buf. 
+// read reads data from the internal readbuf in buf. 
 // Reads will block if not data is available, or until
 // Close is called.
-func (b *buffer) read(buf []byte) (n int, err error) {
+func (b *readbuf) read(buf []byte) (n int, err error) {
 	b.Cond.L.Lock()
 	defer b.Cond.L.Unlock()
 	for {
@@ -80,7 +75,7 @@ func (b *buffer) read(buf []byte) (n int, err error) {
 			}
 			continue
 		}
-		// if there is a next buffer, make it the head
+		// if there is a next readbuf, make it the head
 		if len(b.head.buf) == 0 && b.head != b.tail {
 			b.head = b.head.next
 			continue
@@ -89,7 +84,7 @@ func (b *buffer) read(buf []byte) (n int, err error) {
 		if n > 0 {
 			break
 		}
-		// out of buffers, wait for producer
+		// out of readbufs, wait for producer
 		if b.eof {
 			err = io.EOF
 			break

@@ -336,10 +336,8 @@ func (c *ClientConfig) rand() io.Reader {
 type clientChan struct {
 	packetWriter
 	id, peersId   uint32
-	data          *buffer // receives the payload of channelData messages
-	dataClosed    bool
-	dataExt       *buffer // receives the payload of channelExtendedData messages
-	dataExtClosed bool
+	data          *readbuf // receives the payload of channelData messages
+	dataExt       *readbuf // receives the payload of channelExtendedData messages
 	win           chan int // receives window adjustments
 	winClosed     bool
 	msg           chan interface{} // incoming messages
@@ -350,8 +348,8 @@ func newClientChan(t *transport, id uint32) *clientChan {
 	return &clientChan{
 		packetWriter: t,
 		id:           id,
-		data:         newBuffer(),
-		dataExt:      newBuffer(),
+		data:         newReadBuf(),
+		dataExt:      newReadBuf(),
 		win:          make(chan int, 16),
 		msg:          make(chan interface{}, 16),
 	}
@@ -388,17 +386,11 @@ func (c *clientChan) handleWin(win uint32) {
 }
 
 func (c *clientChan) closeData() {
-	if !c.dataClosed {
-		c.data.Close()
-		c.dataClosed = true
-	}
+	c.data.close()
 }
 
 func (c *clientChan) closeDataExt() {
-	if !c.dataExtClosed {
-		c.dataExt.Close()
-		c.dataExtClosed = true
-	}
+	c.dataExt.close()
 }
 
 func (c *clientChan) closeWin() {
@@ -504,7 +496,7 @@ type chanReader struct {
 	// it unable to receive new messages from the remote side.
 	id           uint32
 	packetWriter // for sending windowAdjustMsg
-	buf          *buffer
+	buf          *readbuf
 }
 
 // Read reads data from the remote process's stdout or stderr.
