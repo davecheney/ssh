@@ -35,7 +35,7 @@ func Client(c net.Conn, config *ClientConfig) (*ClientConn, error) {
 		conn.Close()
 		return nil, err
 	}
-	go conn.mainLoop()
+	go conn.mainloop()
 	return conn, nil
 }
 
@@ -60,8 +60,8 @@ func (c *ClientConn) handshake() error {
 	clientKexInit := kexInitMsg{
 		KexAlgos:                supportedKexAlgos,
 		ServerHostKeyAlgos:      supportedHostKeyAlgos,
-		CiphersClientServer:     supportedCiphers,
-		CiphersServerClient:     supportedCiphers,
+		CiphersClientServer:     c.config.Crypto.ciphers(),
+		CiphersServerClient:     c.config.Crypto.ciphers(),
 		MACsClientServer:        supportedMACs,
 		MACsServerClient:        supportedMACs,
 		CompressionClientServer: supportedCompressions,
@@ -207,8 +207,7 @@ func (c *ClientConn) openChan(typ string) (*clientChan, error) {
 
 // mainloop reads incoming messages and routes channel messages
 // to their respective ClientChans.
-func (c *ClientConn) mainLoop() {
-	// TODO(dfc) signal the underlying close to all channels
+func (c *ClientConn) mainloop() {
 	defer c.Close()
 	for {
 		packet, err := c.readPacket()
@@ -228,7 +227,7 @@ func (c *ClientConn) mainLoop() {
 			peersId := uint32(packet[1])<<24 | uint32(packet[2])<<16 | uint32(packet[3])<<8 | uint32(packet[4])
 			if length := int(packet[5])<<24 | int(packet[6])<<16 | int(packet[7])<<8 | int(packet[8]); length > 0 {
 				packet = packet[9:]
-				c.getChan(peersId).data <- packet[:length]
+				c.getChan(peersId).handleData(packet[:length])
 			}
 		case msgChannelExtendedData:
 			if len(packet) < 13 {
@@ -243,13 +242,21 @@ func (c *ClientConn) mainLoop() {
 				// for stderr on interactive sessions. Other data types are
 				// silently discarded.
 				if datatype == 1 {
-					c.getChan(peersId).dataExt <- packet[:length]
+					c.getChan(peersId).handleDataExt(packet[:length])
 				}
 			}
+		case msgChannelWindowAdjust:
+			if len(packet) < 9 {
+				// malformed window packet
+				break
+			}
+			peersId := uint32(packet[1])<<24 | uint32(packet[2])<<16 | uint32(packet[3])<<8 | uint32(packet[4])
+			win := uint32(packet[5])<<24 | uint32(packet[6])<<16 | uint32(packet[7])<<8 | uint32(packet[8])
+			if win > 0 {
+				c.getChan(peersId).handleWin(win)
+			}
 		default:
-			msg := decode(packet)
-			fmt.Printf("%#v\n", msg)
-			switch msg := msg.(type) {
+			switch msg := decode(packet).(type) {
 			case *channelOpenMsg:
 				c.getChan(msg.PeersId).msg <- msg
 			case *channelOpenConfirmMsg:
@@ -257,23 +264,32 @@ func (c *ClientConn) mainLoop() {
 			case *channelOpenFailureMsg:
 				c.getChan(msg.PeersId).msg <- msg
 			case *channelCloseMsg:
+				fmt.Println("close received")
 				ch := c.getChan(msg.PeersId)
-				close(ch.win)
-				close(ch.data)
-				close(ch.dataExt)
-				c.chanlist.remove(msg.PeersId)
+				ch.closeWin()
+				ch.closeData()
+				ch.closeDataExt()
+				if ch.closeSent {
+					c.chanlist.remove(msg.PeersId)
+					continue
+				}
+				ch.sendClose()
 			case *channelEOFMsg:
-				c.getChan(msg.PeersId).msg <- msg
+				fmt.Printf("mainloop: eof received\n")
+				ch := c.getChan(msg.PeersId)
+				ch.closeData()
+				ch.closeDataExt()
 			case *channelRequestSuccessMsg:
 				c.getChan(msg.PeersId).msg <- msg
 			case *channelRequestFailureMsg:
 				c.getChan(msg.PeersId).msg <- msg
 			case *channelRequestMsg:
 				c.getChan(msg.PeersId).msg <- msg
-			case *windowAdjustMsg:
-				c.getChan(msg.PeersId).win <- int(msg.AdditionalBytes)
+			case *disconnectMsg:
+				fmt.Println("disconnect")
+				break
 			default:
-				fmt.Printf("mainLoop: unhandled %#v\n", msg)
+				fmt.Printf("mainloop: unhandled %#v\n", msg)
 			}
 		}
 	}
@@ -303,6 +319,9 @@ type ClientConfig struct {
 	// A slice of ClientAuth methods. Only the first instance 
 	// of a particular RFC 4252 method will be used during authentication.
 	Auth []ClientAuth
+
+	// Cryptographic-related configuration.
+	Crypto CryptoConfig
 }
 
 func (c *ClientConfig) rand() io.Reader {
@@ -316,29 +335,77 @@ func (c *ClientConfig) rand() io.Reader {
 // over a single SSH connection.
 type clientChan struct {
 	packetWriter
-	id, peersId uint32
-	data        chan []byte      // receives the payload of channelData messages
-	dataExt     chan []byte      // receives the payload of channelExtendedData messages
-	win         chan int         // receives window adjustments
-	msg         chan interface{} // incoming messages
+	id, peersId   uint32
+	data          *buffer // receives the payload of channelData messages
+	dataClosed    bool
+	dataExt       *buffer // receives the payload of channelExtendedData messages
+	dataExtClosed bool
+	win           chan int // receives window adjustments
+	winClosed     bool
+	msg           chan interface{} // incoming messages
+	closeSent     bool
 }
 
 func newClientChan(t *transport, id uint32) *clientChan {
 	return &clientChan{
 		packetWriter: t,
 		id:           id,
-		data:         make(chan []byte, 16),
-		dataExt:      make(chan []byte, 16),
+		data:         newBuffer(),
+		dataExt:      newBuffer(),
 		win:          make(chan int, 16),
 		msg:          make(chan interface{}, 16),
 	}
 }
 
-// Close closes the channel. This does not close the underlying connection.
 func (c *clientChan) Close() error {
+	c.closeWin()
+	c.closeData()
+	c.closeDataExt()
+	if !c.closeSent {
+		return c.sendClose()
+	}
+	return nil
+}
+
+func (c *clientChan) sendClose() error {
+	println("close sent")
+	c.closeSent = true
 	return c.writePacket(marshal(msgChannelClose, channelCloseMsg{
 		PeersId: c.id,
 	}))
+}
+
+func (c *clientChan) handleData(data []byte) {
+	c.data.write(data)
+}
+
+func (c *clientChan) handleDataExt(data []byte) {
+	c.dataExt.write(data)
+}
+
+func (c *clientChan) handleWin(win uint32) {
+	c.win <- int(win)
+}
+
+func (c *clientChan) closeData() {
+	if !c.dataClosed {
+		c.data.Close()
+		c.dataClosed = true
+	}
+}
+
+func (c *clientChan) closeDataExt() {
+	if !c.dataExtClosed {
+		c.dataExt.Close()
+		c.dataExtClosed = true
+	}
+}
+
+func (c *clientChan) closeWin() {
+	if !c.winClosed {
+		close(c.win)
+		c.winClosed = true
+	}
 }
 
 func (c *clientChan) sendChanReq(req channelRequestMsg) error {
@@ -389,7 +456,6 @@ func (c *chanlist) remove(id uint32) {
 	c.Lock()
 	defer c.Unlock()
 	c.chans[int(id)] = nil
-	panic("remove")
 }
 
 // A chanWriter represents the stdin of a remote process.
@@ -403,13 +469,21 @@ type chanWriter struct {
 // Write writes data to the remote process's standard input.
 func (w *chanWriter) Write(data []byte) (n int, err error) {
 	for {
-		if w.rwin == 0 {
-			win, ok := <-w.win
+		select {
+		// test to see the channel is still open for writing
+		case win, ok := <-w.win:
 			if !ok {
 				return 0, io.EOF
 			}
 			w.rwin += win
-			continue
+		default:
+			if w.rwin == 0 {
+				win, ok := <-w.win
+				if !ok {
+					return 0, io.EOF
+				}
+				w.rwin += win
+			}
 		}
 		n = len(data)
 		packet := make([]byte, 0, 9+n)
@@ -423,42 +497,25 @@ func (w *chanWriter) Write(data []byte) (n int, err error) {
 	panic("unreachable")
 }
 
-func (w *chanWriter) Close() error {
-	return w.writePacket(marshal(msgChannelEOF, channelEOFMsg{w.id}))
-}
-
 // A chanReader represents stdout or stderr of a remote process.
 type chanReader struct {
 	// TODO(dfc) a fixed size channel may not be the right data structure.
-	// If writes to this channel block, they will block mainLoop, making
+	// If writes to this channel block, they will block mainloop, making
 	// it unable to receive new messages from the remote side.
-	data         chan []byte // receives data from remote
 	id           uint32
 	packetWriter // for sending windowAdjustMsg
-	buf          []byte
+	buf          *buffer
 }
 
 // Read reads data from the remote process's stdout or stderr.
 func (r *chanReader) Read(data []byte) (int, error) {
-	var ok bool
-	for {
-		if len(r.buf) > 0 {
-			n := copy(data, r.buf)
-			r.buf = r.buf[n:]
-			msg := windowAdjustMsg{
-				PeersId:         r.id,
-				AdditionalBytes: uint32(n),
-			}
-			return n, r.writePacket(marshal(msgChannelWindowAdjust, msg))
-		}
-		r.buf, ok = <-r.data
-		if !ok {
-			return 0, io.EOF
-		}
+	n, err := r.buf.read(data)
+	if err != nil {
+		return n, err
 	}
-	panic("unreachable")
-}
-
-func (r *chanReader) Close() error {
-	return r.writePacket(marshal(msgChannelEOF, channelEOFMsg{r.id}))
+	msg := windowAdjustMsg{
+		PeersId:         r.id,
+		AdditionalBytes: uint32(n),
+	}
+	return n, r.writePacket(marshal(msgChannelWindowAdjust, msg))
 }

@@ -40,6 +40,9 @@ type ServerConfig struct {
 	// key authentication. It must return true iff the given public key is
 	// valid for the given user.
 	PubKeyCallback func(user, algo string, pubkey []byte) bool
+
+	// Cryptographic-related configuration.
+	Crypto CryptoConfig
 }
 
 func (c *ServerConfig) rand() io.Reader {
@@ -257,8 +260,8 @@ func (s *ServerConn) Handshake() error {
 	serverKexInit := kexInitMsg{
 		KexAlgos:                supportedKexAlgos,
 		ServerHostKeyAlgos:      supportedHostKeyAlgos,
-		CiphersClientServer:     supportedCiphers,
-		CiphersServerClient:     supportedCiphers,
+		CiphersClientServer:     s.config.Crypto.ciphers(),
+		CiphersServerClient:     s.config.Crypto.ciphers(),
 		MACsClientServer:        supportedMACs,
 		MACsServerClient:        supportedMACs,
 		CompressionClientServer: supportedCompressions,
@@ -323,7 +326,9 @@ func (s *ServerConn) Handshake() error {
 	if packet[0] != msgNewKeys {
 		return UnexpectedMessageError{msgNewKeys, packet[0]}
 	}
-	s.transport.reader.setupKeys(clientKeys, K, H, H, hashFunc)
+	if err = s.transport.reader.setupKeys(clientKeys, K, H, H, hashFunc); err != nil {
+		return err
+	}
 	if packet, err = s.readPacket(); err != nil {
 		return err
 	}
@@ -631,30 +636,20 @@ func (s *ServerConn) Accept() (Channel, error) {
 
 // A Listener implements a network listener (net.Listener) for SSH connections.
 type Listener struct {
-	listener net.Listener
-	config   *ServerConfig
+	net.Listener
+	config *ServerConfig
 }
 
 // Accept waits for and returns the next incoming SSH connection.
 // The receiver should call Handshake() in another goroutine 
 // to avoid blocking the accepter.
 func (l *Listener) Accept() (*ServerConn, error) {
-	c, err := l.listener.Accept()
+	c, err := l.Listener.Accept()
 	if err != nil {
 		return nil, err
 	}
 	conn := Server(c, l.config)
 	return conn, nil
-}
-
-// Addr returns the listener's network address.
-func (l *Listener) Addr() net.Addr {
-	return l.listener.Addr()
-}
-
-// Close closes the listener.
-func (l *Listener) Close() error {
-	return l.listener.Close()
 }
 
 // Listen creates an SSH listener accepting connections on

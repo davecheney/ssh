@@ -6,17 +6,17 @@ include $(GOROOT)/src/Make.inc
 
 TARG=exp/ssh
 GOFILES=\
+	buffer.go\
 	channel.go\
+	cipher.go\
 	client.go\
 	client_auth.go\
 	common.go\
-	keychain.go\
 	messages.go\
 	server.go\
 	server_shell.go\
 	session.go\
 	tcpip.go\
 	transport.go\
-	queue.go\
 
 include $(GOROOT)/src/Make.pkg

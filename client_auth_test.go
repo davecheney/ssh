@@ -9,6 +9,11 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"io"
+	"io/ioutil"
 	"testing"
 )
 
@@ -61,12 +66,29 @@ func (k *keychain) Key(i int) (interface{}, error) {
 	return k.keys[i].PublicKey, nil
 }
 
-func (k *keychain) Sign(i int, data []byte) (sig []byte, err error) {
+func (k *keychain) Sign(i int, rand io.Reader, data []byte) (sig []byte, err error) {
 	hashFunc := crypto.SHA1
 	h := hashFunc.New()
 	h.Write(data)
 	digest := h.Sum()
-	return rsa.SignPKCS1v15(rand.Reader, k.keys[i], hashFunc, digest)
+	return rsa.SignPKCS1v15(rand, k.keys[i], hashFunc, digest)
+}
+
+func (k *keychain) loadPEM(file string) error {
+	buf, err := ioutil.ReadFile(file)
+	if err != nil {
+		return err
+	}
+	block, _ := pem.Decode(buf)
+	if block == nil {
+		return errors.New("ssh: no key found")
+	}
+	r, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		return err
+	}
+	k.keys = append(k.keys, r)
+	return nil
 }
 
 var pkey *rsa.PrivateKey
@@ -90,22 +112,22 @@ func TestClientAuthPublickey(t *testing.T) {
 	}
 	serverConfig.PasswordCallback = nil
 
-	l, err := Listen("tcp", "0.0.0.0:0", serverConfig)
+	l, err := Listen("tcp", "127.0.0.1:0", serverConfig)
 	if err != nil {
 		t.Fatalf("unable to listen: %s", err)
 	}
 	defer l.Close()
 
-	done := make(chan bool)
+	done := make(chan bool, 1)
 	go func() {
 		c, err := l.Accept()
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer c.Close()
 		if err := c.Handshake(); err != nil {
 			t.Error(err)
 		}
-		defer c.Close()
 		done <- true
 	}()
 
@@ -118,7 +140,7 @@ func TestClientAuthPublickey(t *testing.T) {
 
 	c, err := Dial("tcp", l.Addr().String(), config)
 	if err != nil {
-		t.Errorf("unable to dial remote side: %s", err)
+		t.Fatalf("unable to dial remote side: %s", err)
 	}
 	defer c.Close()
 	<-done
@@ -139,7 +161,7 @@ func TestClientAuthPassword(t *testing.T) {
 	}
 	serverConfig.PubKeyCallback = nil
 
-	l, err := Listen("tcp", "0.0.0.0:0", serverConfig)
+	l, err := Listen("tcp", "127.0.0.1:0", serverConfig)
 	if err != nil {
 		t.Fatalf("unable to listen: %s", err)
 	}
@@ -167,7 +189,7 @@ func TestClientAuthPassword(t *testing.T) {
 
 	c, err := Dial("tcp", l.Addr().String(), config)
 	if err != nil {
-		t.Errorf("unable to dial remote side: %s", err)
+		t.Fatalf("unable to dial remote side: %s", err)
 	}
 	defer c.Close()
 	<-done
@@ -189,7 +211,7 @@ func TestClientAuthPasswordAndPublickey(t *testing.T) {
 		return user == "testuser" && algo == algoname && bytes.Equal(pubkey, expected)
 	}
 
-	l, err := Listen("tcp", "0.0.0.0:0", serverConfig)
+	l, err := Listen("tcp", "127.0.0.1:0", serverConfig)
 	if err != nil {
 		t.Fatalf("unable to listen: %s", err)
 	}
@@ -219,7 +241,7 @@ func TestClientAuthPasswordAndPublickey(t *testing.T) {
 
 	c, err := Dial("tcp", l.Addr().String(), config)
 	if err != nil {
-		t.Errorf("unable to dial remote side: %s", err)
+		t.Fatalf("unable to dial remote side: %s", err)
 	}
 	defer c.Close()
 	<-done

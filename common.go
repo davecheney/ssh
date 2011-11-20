@@ -16,7 +16,6 @@ import (
 const (
 	kexAlgoDH14SHA1 = "diffie-hellman-group14-sha1"
 	hostAlgoRSA     = "ssh-rsa"
-	cipherAES128CTR = "aes128-ctr"
 	macSHA196       = "hmac-sha1-96"
 	compressionNone = "none"
 	serviceUserAuth = "ssh-userauth"
@@ -25,7 +24,6 @@ const (
 
 var supportedKexAlgos = []string{kexAlgoDH14SHA1}
 var supportedHostKeyAlgos = []string{hostAlgoRSA}
-var supportedCiphers = []string{cipherAES128CTR}
 var supportedMACs = []string{macSHA196}
 var supportedCompressions = []string{compressionNone}
 
@@ -130,6 +128,20 @@ func findAgreedAlgorithms(transport *transport, clientKexInit, serverKexInit *ke
 	return
 }
 
+// Cryptographic configuration common to both ServerConfig and ClientConfig.
+type CryptoConfig struct {
+	// The allowed cipher algorithms. If unspecified then DefaultCipherOrder is
+	// used.
+	Ciphers []string
+}
+
+func (c *CryptoConfig) ciphers() []string {
+	if c.Ciphers == nil {
+		return DefaultCipherOrder
+	}
+	return c.Ciphers
+}
+
 // serialize a signed slice according to RFC 4254 6.6.
 func serializeSignature(algoname string, sig []byte) []byte {
 	length := stringLength([]byte(algoname))
@@ -211,4 +223,18 @@ func buildDataSignedForAuth(sessionId []byte, req userAuthRequestMsg, algo, pubK
 	r = marshalString(r, algo)
 	r = marshalString(r, pubKey)
 	return ret
+}
+
+// safestring sanitises s according to the rules RFC 4251, section 9.2. 
+// All control characters except tab, carriage return and newline are
+// replaced by 0x20.
+func safeString(s string) string {
+	out := make([]byte, 0, len(s))
+	for _, c := range []byte(s) {
+		if c < 0x20 && c != 0xd && c != 0xa && c != 0x9 {
+			c = 0x20
+		}
+		out = append(out, c)
+	}
+	return string(out)
 }
