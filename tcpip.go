@@ -6,17 +6,16 @@ package ssh
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"net"
 )
 // Dial initiates a connection to the addr from the remote host.
 func (c *ClientConn) Dial(n, addr string) (net.Conn, error) {
-       a, err := net.ResolveTCPAddr(n, addr)
+       raddr, err := net.ResolveTCPAddr(n, addr)
        if err != nil {
                return nil, err
        }
-       return c.DialTCP(n, nil, a)
+       return c.DialTCP(n, nil, raddr)
 }
 
 // DialTCP connects to the remote address raddr on the network net,
@@ -56,9 +55,7 @@ func (c *ClientConn) DialTCP(n string, laddr, raddr *net.TCPAddr) (net.Conn, err
 		return nil, err
 	}
 	// wait for response
-	msg := <-ch.msg
-	fmt.Printf("DialTCP: %#v\n", msg)
-	switch msg := msg.(type) {
+	switch msg := (<-ch.msg).(type) {
 	case *channelOpenConfirmMsg:
 		ch.peersId = msg.MyId
 		ch.win <- int(msg.MyWindow)
@@ -126,4 +123,8 @@ func (t *tcpchan) SetReadTimeout(nsec int64) error {
 // some of the data was successfully written.
 func (t *tcpchan) SetWriteTimeout(nsec int64) error {
 	return errors.New("tcpchan: timeout not supported")
+}
+
+func (t *tcpchan) Close() error {
+	return nil
 }

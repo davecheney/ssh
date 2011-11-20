@@ -34,7 +34,7 @@ func TestTcpipProxy(t *testing.T) {
 	client := &http.Client{
 		Transport: tr,
 	}
-	resp, err := client.Get("http://www.google.com/")
+	resp, err := client.Get("http://google.com/")
 	if err != nil {
 		t.Fatalf("unable to proxy: %s", err)
 	}
